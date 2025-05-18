@@ -2,7 +2,8 @@
 
 A Spotify module for the OrpheusDL modular achival music program
 
-**This module requires a Spotify Premium account.** Using this module with a non-Premium account will likely result in authentication failures or an inability to download content.
+**This module requires a Spotify Premium account.** 
+Using this module with a non-Premium account will likely result in authentication failures or an inability to download content.
 
 ## Requirements
 
