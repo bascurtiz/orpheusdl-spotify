@@ -2,7 +2,7 @@
 
 A Spotify module for the OrpheusDL modular achival music program
 
-**This module requires a Spotify Premium account.** 
+**This module requires a Spotify Premium account.**<br>
 Using this module with a non-Premium account will likely result in authentication failures or an inability to download content.
 
 ## Requirements
@@ -24,11 +24,12 @@ Using this module with a non-Premium account will likely result in authenticatio
     ```
     After this, the `config/settings.json` file should be updated to include a section for Spotify (or if you are using the GUI, the Spotify module should appear in settings).
 4.  Enter your Spotify username in settings.json (or through the GUI)
-5.  Create a new app here: https://developer.spotify.com/dashboard
-    a. Enter a name (orpheusdl-spotify for ex.) & app description (same)
-    b. Copy/paste the Callback URL stated in settings.json at Redirect URIs. Hit Add.
-    c. Click Web API + Agree with Spotify's terms & conditions. Hit Save.
-    d. Copy/paste the Client ID + Client Secret into settings.json. Hit Save.
+5.  Create a new app here: https://developer.spotify.com/dashboard  
+    a. Enter a name (orpheusdl-spotify for ex.) & app description (same)<br>
+    b. Copy/paste the Callback URL stated in settings.json at Redirect URIs. Hit Add.<br>
+    c. Click Web API + Agree with Spotify's terms & conditions. Hit Save.<br>
+    d. Copy/paste the Client ID + Client Secret into settings.json. Hit Save.<br>
+
 
     
     After this, the `config/settings.json` file should be updated to include a section for Spotify (or if you are using the GUI, the Spotify module should appear in settings).
