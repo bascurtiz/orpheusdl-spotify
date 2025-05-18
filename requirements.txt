@@ -1,0 +1,4 @@
+# Requirements for the OrpheusDL Spotify module
+spotipy>=2.23.0
+librespot @ git+https://github.com/kokarare1212/librespot-python.git
+pkce>=1.0.3
