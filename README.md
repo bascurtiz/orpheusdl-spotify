@@ -24,7 +24,7 @@ A Spotify module for the OrpheusDL modular achival music program
 5.  Create a new app here: https://developer.spotify.com/dashboard  
     a. Enter a name (`orpheusdl-spotify` for ex.) & app description (same)<br>
     b. Copy/paste the `Callback URL` stated in `settings.json` at Redirect URIs. Hit Add.<br>
-    c. Click Web API + Agree with Spotify's terms & conditions. Hit Save.<br>
+    c. Click Web API + agree with Spotify's terms & conditions. Hit Save.<br>
     d. Copy/paste the `Client ID` + `Client Secret` into `settings.json`. Hit Save.<br>
 
 ## Quick Usage Example (CLI)
@@ -59,7 +59,7 @@ This module employs a two-stage authentication process:
 
 *   **Purpose:** Used for accessing the actual audio streams for downloading tracks.
 
-Clearing the cache files (both `/config/.spotify_cache/spotipy_token_cache.json` and the contents of `/config/.spotify_cache/librespot_cache/`) will trigger a full re-authentication process for both Web and Stream APIs.
+Clearing the cache folder (`/config/.spotify_cache/`) will trigger a full re-authentication process for both Web and Stream APIs.
 
 ## Usage
 
@@ -74,7 +74,8 @@ Once configured and authenticated:
 
 ## Limitations & Considerations
 
-*   **Audio Quality:** Downloads are obtained by capturing the audio stream. Spotify typically streams in Ogg Vorbis format (qualities around ~96kbps, ~160kbps, or ~320kbps). **Lossless (HiFi/FLAC) downloads are NOT supported** as the underlying stream from Spotify to third-party clients like this is (still) lossy.
+*   **Audio Quality:** Downloads are obtained by capturing the audio stream. Spotify typically streams in Ogg Vorbis format (~320kbps).<br>
+**Lossless (HiFi/FLAC) downloads are NOT supported** as the underlying stream from Spotify to third-party clients like this is (still) lossy.
 *   **Terms of Service:** Downloading streams may violate Spotify\'s Terms of Service. Use this module responsibly and at your own risk.
 *   **Premium Required:** This module **will not work** with Spotify Free accounts.
 *   **Rate Limiting:** A 30 seconds pause in between downloads is recommended, see: [here](https://developer.spotify.com/documentation/web-api/concepts/rate-limits) and [here](https://github.com/zotify-dev/zotify/issues/186#issuecomment-2608381052)
