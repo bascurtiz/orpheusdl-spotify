@@ -2,9 +2,6 @@
 
 A Spotify module for the OrpheusDL modular achival music program
 
-**This module requires a Spotify Premium account.**<br>
-Using this module with a non-Premium account will likely result in authentication failures or an inability to download content.
-
 ## Requirements
 
 1.  **Spotify Premium Account:** Essential for accessing audio streams in high quality.
@@ -61,33 +58,10 @@ This module employs a two-stage authentication process:
 ### 1. Web API Authentication (for Metadata & Search)
 
 *   **Purpose:** Used for searching, retrieving metadata (track, album, playlist, artist info), and other general API interactions.
-*   **Mechanism:** Standard OAuth 2.0 Authorization Code Flow.
-*   **Process:**
-    1.  Requires your `client_id`, `client_secret`, and the `redirect_uri` you configured.
-    2.  The first time you use a feature requiring Web API access (or after credentials expire), OrpheusDL (console or GUI) will typically prompt you to open a Spotify authorization URL in your browser.
-    3.  In your browser, log in to Spotify and authorize the application.
-    4.  After authorization, Spotify will redirect you to your specified `redirect_uri`. **Copy the *entire* URL** from your browser's address bar (it will look something like `http://your-redirect-uri/?code=A_LONG_CODE_HERE...`).
-    5.  Paste this full redirected URL back into OrpheusDL when prompted.
-*   **Caching:** Successful Web API authentication tokens are cached by the underlying `spotipy` library (`/config/.spotify_cache/web_api_credentials.json` in your OrpheusDL directory) to minimize re-authentication.
 
 ### 2. Stream API Authentication (for Downloads via Librespot)
 
 *   **Purpose:** Used for accessing the actual audio streams for downloading tracks.
-*   **Mechanism:** Primarily uses an interactive PKCE-based OAuth flow, with fallbacks to cached credentials.
-*   **Process (Interactive PKCE OAuth - Recommended & Preferred):**
-    1.  This is generally the **default and most reliable** method for authenticating the streaming component.
-    2.  When a download is initiated and stream authentication is needed, the module (via its internal Librespot integration) will attempt to start this flow.
-    3.  It automatically opens an authorization URL in your web browser.
-    4.  You will need to log in and authorize the "app" (which in this context is the Librespot client).
-    5.  The flow uses a temporary local web server (typically on `http://127.0.0.1:4381/login`) to automatically capture the authorization code. **You do not need to configure this local redirect URI in your Spotify app settings.**
-    6.  If using the OrpheusDL GUI, this process can be more seamless with integrated dialogs.
-*   **Process (Cached Librespot Credentials):**
-    1.  After a successful PKCE authentication, Librespot caches its own stream access credentials.
-    2.  These are stored in `credentials.json` file within a directory like `/config/.spotify_cache/librespot_cache/` (relative to your OrpheusDL directory).
-    3.  On subsequent runs, the module will attempt to use these cached credentials automatically.*   
-*   **Important:**
-    *   Manual creation or placement of a `credentials.json` file is **not required** for the primary PKCE authentication flow.
-    *   Follow any prompts from OrpheusDL (console or GUI) during the first download attempt.
 
 Clearing the cache files (both `/config/.spotify_cache/spotipy_token_cache.json` and the contents of `/config/.spotify_cache/librespot_cache/`) will trigger a full re-authentication process for both Web and Stream APIs.
 
@@ -116,4 +90,5 @@ Once configured and authenticated:
 
 ## Known Limitations
 
-*   Genre tag will be absent due to Orpheus core model structure. 
+*   Genre tag will be absent due to Orpheus core model structure.
+*   Only works with [My fork](https://github.com/bascurtiz/orpheusdl) of OrpheusDL
