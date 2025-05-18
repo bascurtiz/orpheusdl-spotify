@@ -14,17 +14,23 @@ A Spotify module for the OrpheusDL modular achival music program
 2.  ```
     git clone https://github.com/bascurtiz/orpheusdl-spotify.git modules/spotify
     ```
-3.  Run OrpheusDL once to allow it to recognize the new module and update its main configuration:
+3.  ```
+    cd modules/spotify
+    pip install -r requirements.txt
+    cd..
+    cd..
+    ```
+4.  Run OrpheusDL once (to allow it to recognize the new module and update its main configuration):
     ```
     python orpheus.py
     ```
-    After this, the `config/settings.json` file should be updated to include a section for Spotify (or if you are using the GUI, the Spotify module should appear in settings).<br>
-4.  Enter your Spotify username in `settings.json` (or through the [GUI](https://github.com/bascurtiz/orpheusdl-gui))<br>
+    `config/settings.json` file should now be updated to include a section for Spotify (or if you are using the GUI, the Spotify module should appear in settings).<p>
+4.  Enter your Spotify username in `settings.json` (or through the [GUI](https://github.com/bascurtiz/orpheusdl-gui))<p>
 5.  Create a new app here: https://developer.spotify.com/dashboard  
-    a. Enter a name (`orpheusdl-spotify` for ex.) & app description (same)<br>
-    b. Copy/paste the `Callback URL` stated in `settings.json` at Redirect URIs. Hit Add.<br>
-    c. Click Web API + agree with Spotify's terms & conditions. Hit Save.<br>
-    d. Copy/paste the `Client ID` + `Client Secret` into `settings.json`. Hit Save.<br>
+    **A.** Enter a name (`orpheusdl-spotify` for ex.) & app description (same)<br>
+    **B.** Copy/paste the `Callback URL` stated in `settings.json` at Redirect URIs. Hit Add.<br>
+    **C.** Click Web API + agree with Spotify's terms & conditions. Hit Save.<br>
+    **D.** Copy/paste the `Client ID` + `Client Secret` into `settings.json`. Hit Save.<br>
 
 ## Quick Usage Example (CLI)
 
