@@ -5,9 +5,8 @@ A Spotify module for the OrpheusDL modular achival music program
 ## Requirements
 
 1.  **Spotify Premium Account:** Essential for accessing audio streams in high quality.
-2.  **Spotify Application Credentials:** You need to register an application on the [Spotify Developer Dashboard](https://developer.spotify.com/dashboard) to get a **Client ID** and **Client Secret**.
-3.  **`librespot-python` Based Backend:** This module integrates `librespot-python` functionality internally to handle audio streaming.
-4.  **OrpheusDL:** [My fork](https://github.com/bascurtiz/orpheusdl) is needed to make Spotify's module work
+2.  **OrpheusDL:** [My fork](https://github.com/bascurtiz/orpheusdl) is needed to make Spotify's module work
+3.  This module integrates `librespot-python` functionality internally to handle audio streaming.
 
 ## Installation
 
@@ -83,7 +82,8 @@ Once configured and authenticated:
 
 ## Known Issues
 
-*   Rate-limiting. 30 seconds pause in between downloads is recommended, when you download more than ~20 tracks in one-go. If not, 1 second will suffice.
+*   Rate-limiting. 30 seconds pause in between downloads is recommended, when downloading > ~20 tracks in one-go.<br>
+If not, 1 second will suffice.
 
 ## Known Limitations
 
