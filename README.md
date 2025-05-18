@@ -27,10 +27,6 @@ A Spotify module for the OrpheusDL modular achival music program
     c. Click Web API + Agree with Spotify's terms & conditions. Hit Save.<br>
     d. Copy/paste the Client ID + Client Secret into settings.json. Hit Save.<br>
 
-
-    
-    After this, the `config/settings.json` file should be updated to include a section for Spotify (or if you are using the GUI, the Spotify module should appear in settings).
-
 ## Quick Usage Example (CLI)
 
 Once the module is installed, configured, and you have successfully authenticated (see Configuration and Authentication sections below), you can download a track using a command like this from your main OrpheusDL directory:
