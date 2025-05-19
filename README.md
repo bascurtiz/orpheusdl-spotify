@@ -10,6 +10,8 @@ A Spotify module for the OrpheusDL modular achival music program
 
 ## Installation
 
+[![Watch how to install](https://i.imgur.com/sY9axh3.png)](https://youtu.be/uMUsl-Au7G0)
+
 1.  Go to your orpheusdl/ directory and run the following command:
 2.  ```
     git clone https://github.com/bascurtiz/orpheusdl-spotify.git modules/spotify
