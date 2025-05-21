@@ -1,6 +1,6 @@
 # OrpheusDL - Spotify
 
-A Spotify module for the OrpheusDL modular achival music program
+A Spotify module for the OrpheusDL modular archival music program
 
 ## Requirements
 
