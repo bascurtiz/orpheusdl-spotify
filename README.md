@@ -10,7 +10,7 @@ A Spotify module for the OrpheusDL modular archival music program
 
 ## Installation
 
-[![Watch how to install](https://i.imgur.com/FwvPO9K.png)](https://youtu.be/dZPOc6WQ72w)
+[![Watch how to install](https://i.imgur.com/K1Mq9Ho.png)](https://youtu.be/dZPOc6WQ72w)
 
 1.  Go to your orpheusdl/ directory and run the following command:
 2.  ```
