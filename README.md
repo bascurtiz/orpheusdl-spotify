@@ -37,8 +37,8 @@ Follow any on-screen instructions for the initial authentication.
 
 When enabling the Spotify module in OrpheusDL (e.g., via `config/settings.json` or the GUI), the following settings are relevant:
 
-*   **`username` (Informational):** After a successful OAuth authentication, your Spotify username might be displayed here or used for informational purposes. It is not used as a primary credential input for authentication.
-*   **`download_pause_seconds` (30s by default):** A 30 seconds pause in between downloads is recommended, see: [here](https://developer.spotify.com/documentation/web-api/concepts/rate-limits) and [here](https://github.com/zotify-dev/zotify/issues/186#issuecomment-2608381052)
+*   **`username`:** After a successful OAuth authentication, your Spotify username might be displayed here or used for informational purposes. It is not used as a primary credential input for authentication.
+*   **`download_pause_seconds`:** A 30 seconds pause in between downloads is recommended, see: [here](https://developer.spotify.com/documentation/web-api/concepts/rate-limits) and [here](https://github.com/zotify-dev/zotify/issues/186#issuecomment-2608381052)
 
 ## Authentication
 
@@ -76,7 +76,10 @@ Once configured and authenticated:
 
 *   **Search:** Use the standard OrpheusDL search commands/UI. The module supports searching for tracks, albums, artists, and playlists.
 *   **Download:** Provide a Spotify URL (track, album, playlist, artist) to OrpheusDL.
-Example Track URL: https://open.spotify.com/track/yourTrackId\n
-Example Album URL: https://open.spotify.com/album/yourAlbumId\n
-Example Playlist URL: https://open.spotify.com/playlist/yourPlaylistId\n
+Example Track URL: https://open.spotify.com/track/yourTrackId<br>
+
+Example Album URL: https://open.spotify.com/album/yourAlbumId<br>
+
+Example Playlist URL: https://open.spotify.com/playlist/yourPlaylistId<br>
+
 Example Artist URL: https://open.spotify.com/artist/yourArtistId
