@@ -75,7 +75,7 @@ This module primarily uses a unified OAuth 2.0 PKCE (Proof Key for Code Exchange
 Once configured and authenticated:
 
 *   **Search:** Use the standard OrpheusDL search commands/UI. The module supports searching for tracks, albums, artists, and playlists.
-*   **Download:** Provide a Spotify URL (track, album, playlist, artist) to OrpheusDL.
+*   **Download:** Provide a Spotify URL (track, album, playlist, artist) to OrpheusDL.<br>
 Example Track URL: https://open.spotify.com/track/yourTrackId<br>
 
 Example Album URL: https://open.spotify.com/album/yourAlbumId<br>
