@@ -76,7 +76,7 @@ Once configured and authenticated:
 
 *   **Search:** Use the standard OrpheusDL search commands/UI. The module supports searching for tracks, albums, artists, and playlists.
 *   **Download:** Provide a Spotify URL (track, album, playlist, artist) to OrpheusDL.
-Example Track URL: https://open.spotify.com/track/yourTrackId
-Example Album URL: https://open.spotify.com/album/yourAlbumId
-Example Playlist URL: https://open.spotify.com/playlist/yourPlaylistId
+Example Track URL: https://open.spotify.com/track/yourTrackId\n
+Example Album URL: https://open.spotify.com/album/yourAlbumId\n
+Example Playlist URL: https://open.spotify.com/playlist/yourPlaylistId\n
 Example Artist URL: https://open.spotify.com/artist/yourArtistId
