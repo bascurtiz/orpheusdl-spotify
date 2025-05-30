@@ -77,7 +77,5 @@ Once configured and authenticated:
 Example Track URL: https://open.spotify.com/track/yourTrackId<br>
 
 Example Album URL: https://open.spotify.com/album/yourAlbumId<br>
-
 Example Playlist URL: https://open.spotify.com/playlist/yourPlaylistId<br>
-
 Example Artist URL: https://open.spotify.com/artist/yourArtistId
