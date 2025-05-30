@@ -839,6 +839,13 @@ class SpotifyAPI:
 
     def search(self, query_type_enum_or_str, query_str: str, track_info=None, market: Optional[str] = None, limit: int = 20, _retry_attempted: bool = False) -> List[dict]:
         self.logger.info(f"SpotifyAPI.search: type='{query_type_enum_or_str}', query='{query_str}', limit={limit}{', retry' if _retry_attempted else ''}")
+        
+        # Validate and adjust limit - Spotify API has a maximum of 50 per request
+        SPOTIFY_MAX_LIMIT_PER_REQUEST = 50
+        total_requested = limit
+        if limit > SPOTIFY_MAX_LIMIT_PER_REQUEST:
+            self.logger.info(f"SpotifyAPI.search: Requested limit {limit} exceeds Spotify's max of {SPOTIFY_MAX_LIMIT_PER_REQUEST}. Will use pagination to fetch all requested results.")
+        
         # Initial auth check
         if not self.stored_token or not self.stored_token.access_token or self.stored_token.expired():
             self.logger.info("SpotifyAPI.search: Token missing, invalid or expired. Attempting to load/refresh session.")
@@ -861,75 +868,104 @@ class SpotifyAPI:
         
         search_url = "https://api.spotify.com/v1/search"
         headers = {'Authorization': f'Bearer {self.stored_token.access_token}'}
-        params = {'q': query_str, 'type': query_type_str, 'limit': limit}
-        if effective_market:
-            params['market'] = effective_market
-            self.logger.info(f"SpotifyAPI.search: Using market: {effective_market}")
-
-        try:
-            response = requests.get(search_url, headers=headers, params=params, timeout=DEFAULT_REQUEST_TIMEOUT)
-            response.raise_for_status()
-            search_results = response.json()
+        
+        # Collect all results across multiple requests if needed
+        all_items = []
+        offset = 0
+        
+        while len(all_items) < total_requested:
+            # Calculate how many items to request in this batch
+            remaining_needed = total_requested - len(all_items)
+            current_limit = min(remaining_needed, SPOTIFY_MAX_LIMIT_PER_REQUEST)
             
-            plural_type = query_type_str + "s"
-            if plural_type in search_results and "items" in search_results[plural_type]:
-                items = search_results[plural_type]["items"]
-                if not items:
-                     self.logger.info(f"No {plural_type} found for '{query_str}'.")
-                return items 
-            else:
-                self.logger.warning(f"'{plural_type}' or '{plural_type}.items' not in search response for query '{query_str}'. Response keys: {list(search_results.keys())}")
-                if query_type_str in search_results and isinstance(search_results[query_type_str], dict) and "id" in search_results[query_type_str]:
-                    self.logger.info(f"Found a single item matching type '{query_type_str}' directly in response.")
-                    return [search_results[query_type_str]]
-                # Handle API error messages if present
-                if "error" in search_results:
-                    error_details = search_results["error"]
-                    msg = error_details.get("message", "Unknown Spotify API error during search")
-                    status = error_details.get("status", 0)
-                    self.logger.error(f"Spotify API error during search: {status} - {msg}")
-                    if status == 401: # This should ideally be caught by HTTPError, but as a fallback
-                        raise SpotifyAuthError(f"Search failed due to authorization issue (API Error: {msg}). Token may be invalid or scopes insufficient.")
-                    elif status == 404:
-                         raise SpotifyItemNotFoundError(f"Search query '{query_str}' of type '{query_type_str}' not found (API Error: {msg}).")
-                    else: 
-                        raise SpotifyApiError(f"Spotify API error during search: {status} - {msg}")
-            return []
+            params = {
+                'q': query_str, 
+                'type': query_type_str, 
+                'limit': current_limit,
+                'offset': offset
+            }
+            if effective_market:
+                params['market'] = effective_market
+                
+            self.logger.debug(f"SpotifyAPI.search: Making request with limit={current_limit}, offset={offset}")
 
-        except requests.exceptions.HTTPError as http_err:
-            if http_err.response.status_code == 401:
-                self.logger.warning(f"SpotifyAPI.search: Auth error (401) for query '{query_str}'. Token might be invalid.")
-                if not _retry_attempted:
-                    self.logger.info("SpotifyAPI.search: Attempting re-auth and retry for 401.")
-                    self.stored_token = None
-                    if self._perform_oauth_flow():
-                        self.logger.info("SpotifyAPI.search: Re-auth successful. Retrying call.")
-                        return self.search(query_type_enum_or_str, query_str, track_info, market, limit, _retry_attempted=True)
-                    else:
-                        self.logger.error("SpotifyAPI.search: Re-auth failed after 401.")
-                        raise SpotifyAuthError(f"Re-authentication failed for search '{query_str}' after 401.")
+            try:
+                response = requests.get(search_url, headers=headers, params=params, timeout=DEFAULT_REQUEST_TIMEOUT)
+                response.raise_for_status()
+                search_results = response.json()
+                
+                plural_type = query_type_str + "s"
+                if plural_type in search_results and "items" in search_results[plural_type]:
+                    items = search_results[plural_type]["items"]
+                    if not items:
+                        # No more results available
+                        self.logger.info(f"No more {plural_type} found for '{query_str}' at offset {offset}.")
+                        break
+                    
+                    all_items.extend(items)
+                    offset += len(items)
+                    
+                    # Check if we got fewer items than requested - indicates end of results
+                    if len(items) < current_limit:
+                        self.logger.info(f"Received {len(items)} items (less than requested {current_limit}), indicating end of results.")
+                        break
+                        
                 else:
-                    self.logger.error(f"SpotifyAPI.search: Auth error (401) for '{query_str}' after retry.")
-                    raise SpotifyAuthError(f"Auth failed for search '{query_str}' (401) after retry.")
-            elif http_err.response.status_code == 404:
-                self.logger.warning(f"SpotifyAPI.search: Query '{query_str}' (type {query_type_str}) resulted in 404.")
-                raise SpotifyItemNotFoundError(f"Search query '{query_str}' (type {query_type_str}) not found (HTTP 404).")
-            elif http_err.response.status_code == 429:
-                self.logger.warning(f"Spotify API rate limit hit (429) during search for '{query_str}'. Raw: {http_err.response.text[:200]}")
-                raise SpotifyRateLimitDetectedError(f"Spotify API rate limit hit during search for '{query_str}'.")
-            else:
-                self.logger.error(f"SpotifyAPI.search: HTTP error for '{query_str}': {http_err.response.status_code} - {http_err.response.text[:200]}", exc_info=False)
-                raise SpotifyApiError(f"HTTP error during search for '{query_str}': {http_err.response.status_code} - {http_err.response.text[:200]}") from http_err
-        except requests.exceptions.RequestException as req_err:
-            self.logger.error(f"SpotifyAPI.search: RequestException for '{query_str}': {req_err}", exc_info=False)
-            raise SpotifyApiError(f"Network or request error during search for '{query_str}': {req_err}")
-        except SpotifyAuthError:
-            raise
-        except Exception as e:
-            self.logger.error(f"SpotifyAPI.search: Unexpected error for '{query_str}': {e}", exc_info=True)
-            if isinstance(e, SpotifyApiError): raise
-            raise SpotifyApiError(f"An unexpected error occurred during search for '{query_str}': {e}")
-            
+                    self.logger.warning(f"'{plural_type}' or '{plural_type}.items' not in search response for query '{query_str}'. Response keys: {list(search_results.keys())}")
+                    if query_type_str in search_results and isinstance(search_results[query_type_str], dict) and "id" in search_results[query_type_str]:
+                        self.logger.info(f"Found a single item matching type '{query_type_str}' directly in response.")
+                        return [search_results[query_type_str]]
+                    # Handle API error messages if present
+                    if "error" in search_results:
+                        error_details = search_results["error"]
+                        msg = error_details.get("message", "Unknown Spotify API error during search")
+                        status = error_details.get("status", 0)
+                        self.logger.error(f"Spotify API error during search: {status} - {msg}")
+                        if status == 401: # This should ideally be caught by HTTPError, but as a fallback
+                            raise SpotifyAuthError(f"Search failed due to authorization issue (API Error: {msg}). Token may be invalid or scopes insufficient.")
+                        elif status == 404:
+                             raise SpotifyItemNotFoundError(f"Search query '{query_str}' of type '{query_type_str}' not found (API Error: {msg}).")
+                        else: 
+                            raise SpotifyApiError(f"Spotify API error during search: {status} - {msg}")
+                    break
+
+            except requests.exceptions.HTTPError as http_err:
+                if http_err.response.status_code == 401:
+                    self.logger.warning(f"SpotifyAPI.search: Auth error (401) for query '{query_str}'. Token might be invalid.")
+                    if not _retry_attempted:
+                        self.logger.info("SpotifyAPI.search: Attempting re-auth and retry for 401.")
+                        self.stored_token = None
+                        if self._perform_oauth_flow():
+                            self.logger.info("SpotifyAPI.search: Re-auth successful. Retrying call.")
+                            return self.search(query_type_enum_or_str, query_str, track_info, market, limit, _retry_attempted=True)
+                        else:
+                            self.logger.error("SpotifyAPI.search: Re-auth failed after 401.")
+                            raise SpotifyAuthError(f"Re-authentication failed for search '{query_str}' after 401.")
+                    else:
+                        self.logger.error(f"SpotifyAPI.search: Auth error (401) for '{query_str}' after retry.")
+                        raise SpotifyAuthError(f"Auth failed for search '{query_str}' (401) after retry.")
+                elif http_err.response.status_code == 404:
+                    self.logger.warning(f"SpotifyAPI.search: Query '{query_str}' (type {query_type_str}) resulted in 404.")
+                    raise SpotifyItemNotFoundError(f"Search query '{query_str}' (type {query_type_str}) not found (HTTP 404).")
+                elif http_err.response.status_code == 429:
+                    self.logger.warning(f"Spotify API rate limit hit (429) during search for '{query_str}'. Raw: {http_err.response.text[:200]}")
+                    raise SpotifyRateLimitDetectedError(f"Spotify API rate limit hit during search for '{query_str}'.")
+                else:
+                    self.logger.error(f"SpotifyAPI.search: HTTP error for '{query_str}': {http_err.response.status_code} - {http_err.response.text[:200]}", exc_info=False)
+                    raise SpotifyApiError(f"HTTP error during search for '{query_str}': {http_err.response.status_code} - {http_err.response.text[:200]}") from http_err
+            except requests.exceptions.RequestException as req_err:
+                self.logger.error(f"SpotifyAPI.search: RequestException for '{query_str}': {req_err}", exc_info=False)
+                raise SpotifyApiError(f"Network or request error during search for '{query_str}': {req_err}")
+            except SpotifyAuthError:
+                raise
+            except Exception as e:
+                self.logger.error(f"SpotifyAPI.search: Unexpected error for '{query_str}': {e}", exc_info=True)
+                if isinstance(e, SpotifyApiError): raise
+                raise SpotifyApiError(f"An unexpected error occurred during search for '{query_str}': {e}")
+        
+        self.logger.info(f"SpotifyAPI.search: Successfully retrieved {len(all_items)} items for '{query_str}' (requested: {total_requested})")
+        return all_items
+
     def _save_stream_to_temp_file(self, stream_object, determined_codec_enum: CodecEnum) -> Optional[str]:
         temp_file_path = None
         try:
