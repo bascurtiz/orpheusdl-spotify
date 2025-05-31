@@ -317,9 +317,82 @@ class ModuleInterface:
                             'name': item_dict.get('name'),
                             'result_id': item_dict.get('id'),
                             'explicit': item_dict.get('explicit', False), # Default to False if not present
-                            'artists': [artist.get('name') for artist in item_dict.get('artists', []) if artist.get('name')],
-                            'image_url': None # Initialize, will be populated below
+                            'artists': [],  # Initialize, will be populated below based on item type
+                            'image_url': None, # Initialize, will be populated below
+                            'duration': None,  # Initialize, will be populated below
+                            'year': None,      # Initialize, will be populated below
+                            'additional': []   # Initialize, will be populated with genres below
                         }
+
+                        # Extract artists/creator based on item type
+                        item_type = item_dict.get('type', 'unknown')
+                        if item_type == 'playlist':
+                            # For playlists, use the owner/creator name
+                            owner_data = item_dict.get('owner', {})
+                            if isinstance(owner_data, dict):
+                                creator_name = owner_data.get('display_name') or owner_data.get('name')
+                                if creator_name:
+                                    kwargs_for_sr['artists'] = [creator_name]
+                        else:
+                            # For tracks, albums, artists - use the artists array
+                            artists_data = item_dict.get('artists', [])
+                            if isinstance(artists_data, list):
+                                kwargs_for_sr['artists'] = [artist.get('name') for artist in artists_data if artist.get('name')]
+
+                        # Extract genres from different sources based on item type
+                        genres = []
+                        if item_type == 'track':
+                            # For tracks, genres are usually in the album or artist data
+                            album_data = item_dict.get('album', {})
+                            if isinstance(album_data, dict) and album_data.get('genres'):
+                                genres.extend(album_data['genres'])
+                            # Also check artist genres if available (less common in search results)
+                            artists_data = item_dict.get('artists', [])
+                            for artist in artists_data:
+                                if isinstance(artist, dict) and artist.get('genres'):
+                                    genres.extend(artist['genres'])
+                        elif item_type == 'album':
+                            # For albums, check direct genres field
+                            if item_dict.get('genres') and isinstance(item_dict['genres'], list):
+                                genres.extend(item_dict['genres'])
+                        elif item_type == 'artist':
+                            # For artists, check direct genres field
+                            if item_dict.get('genres') and isinstance(item_dict['genres'], list):
+                                genres.extend(item_dict['genres'])
+                        elif item_type == 'playlist':
+                            # Playlists don't typically have genre information in search results
+                            pass
+                        
+                        # Remove duplicates and populate additional field
+                        if genres:
+                            unique_genres = list(dict.fromkeys(genres))  # Preserve order while removing duplicates
+                            kwargs_for_sr['additional'] = unique_genres[:3]  # Limit to first 3 genres to avoid UI clutter
+
+                        # Extract duration from duration_ms (convert from milliseconds to seconds)
+                        duration_ms = item_dict.get('duration_ms')
+                        if duration_ms and isinstance(duration_ms, int):
+                            kwargs_for_sr['duration'] = duration_ms // 1000  # Convert ms to seconds
+
+                        # Extract year from album release date for tracks, or release_date for albums
+                        year_value = None
+                        if item_dict.get('type') == 'track' and item_dict.get('album', {}).get('release_date'):
+                            release_date = item_dict['album']['release_date']
+                            if release_date and len(release_date) >= 4:
+                                try:
+                                    year_value = release_date[:4]  # Extract year from YYYY-MM-DD format
+                                except (ValueError, TypeError):
+                                    pass
+                        elif item_dict.get('release_date'):
+                            # For albums, artists, or other items with direct release_date
+                            release_date = item_dict['release_date']
+                            if release_date and len(release_date) >= 4:
+                                try:
+                                    year_value = release_date[:4]  # Extract year from YYYY-MM-DD format
+                                except (ValueError, TypeError):
+                                    pass
+                        
+                        if year_value:
+                            kwargs_for_sr['year'] = year_value
 
                         # Correctly extract image_url
                         current_image_url = None
@@ -574,7 +647,7 @@ class ModuleInterface:
         """Helper to fetch track stream info with retry logic for librespot errors."""
         stream_info = None
         max_retries = 3
-        retry_delay_seconds = 2
+        retry_delay_seconds = 10
         RATE_LIMIT_BACKOFF_SECONDS = 30
 
         for attempt in range(max_retries):
