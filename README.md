@@ -15,7 +15,7 @@ A Spotify module for the OrpheusDL modular archival music program
     ```
 3.  ```
     cd modules/spotify
-    pip install -r requirements.txt
+    pip install --upgrade --ignore-installed -r requirements.txt
     cd..
     cd..
     ```
