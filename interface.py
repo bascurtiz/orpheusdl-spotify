@@ -36,7 +36,7 @@ try:
         DownloadTypeEnum, TrackDownloadInfo, SearchResult, TrackInfo,
         AlbumInfo, PlaylistInfo, ArtistInfo, CoverInfo, Tags,
         QualityEnum, CodecOptions, CoverOptions, DownloadEnum, CodecEnum,
-        MediaIdentification, ModuleController, codec_data
+        MediaIdentification, ModuleController, codec_data, ImageFileTypeEnum
     )
     from utils.exceptions import ModuleGeneralError, ModuleAPIError # Corrected imports    
   
@@ -611,37 +611,52 @@ class ModuleInterface:
         
     def get_artist_info(self, artist_id: str, metadata: Optional[ArtistInfo] = None, **kwargs) -> Optional[ArtistInfo]:
         # Ensure authentication before proceeding
-        if not self._ensure_authenticated("get_artist_info"):
+        if not self._ensure_authenticated(context_message="get_artist_info"):
             return None
-
-        # Log unused kwargs if any, like return_credited_albums, for now        
-        kwargs.pop('metadata', None) # metadata is an explicit param for the API call, remove from general kwargs if present.
-        if kwargs: # Log any other unexpected kwargs
-            self.logger.debug(f"Spotify ModuleInterface.get_artist_info received unused kwargs: {kwargs}")
-
+        
         try:
-            return self.spotify_api.get_artist_info(artist_id, metadata=metadata) # Pass metadata explicitly
-        except SpotifyAuthError as e:
-            self.printer.oprint(f"Spotify authentication error while fetching artist info: {e}")
-            self.logger.error(f"SpotifyAuthError in get_artist_info: {e}", exc_info=self.debug_mode)
-            return None
-        except SpotifyItemNotFoundError as e:
-            self.printer.oprint(f"Artist not found on Spotify: {e}")
-            self.logger.warning(f"SpotifyItemNotFoundError in get_artist_info: {e}")
-            return None
+            return self.spotify_api.get_artist_info(artist_id, metadata=metadata)
         except SpotifyApiError as e:
-            self.printer.oprint(f"Spotify API error while fetching artist info: {e}")
-            self.logger.error(f"SpotifyApiError in get_artist_info: {e}", exc_info=self.debug_mode)
-            return None
-        except Exception as e:
-            self.printer.oprint(f"An unexpected error occurred while fetching Spotify artist info: {e}")
-            self.logger.error(f"Unexpected exception in ModuleInterface.get_artist_info: {e}", exc_info=True)
+            self.module_error(f"Failed to get artist info for {artist_id}: {e}")
             return None
 
     def get_track_cover(self, track_id: str, cover_options: CoverOptions, data=None) -> Optional[CoverInfo]:
-        """Gets cover art information for a track. (Not Implemented)"""
-        logging.warning("get_track_cover not yet implemented in Spotify module. Cover URL provided via get_track_info.")
-        return None
+        """Fetches the cover information for a given track ID."""
+        if not self._ensure_authenticated(context_message="get_track_cover"):
+            self.printer.oprint("Authentication required to fetch track cover.", drop_level=1)
+            return None
+
+        try:
+            # Use the existing get_track_by_id method which should return metadata including the cover
+            track_data = self.spotify_api.get_track_by_id(track_id)
+            if not track_data:
+                self.printer.oprint(f"Could not retrieve metadata for track_id: {track_id}", drop_level=1)
+                return None
+
+            # Extract cover URL from the track data
+            # Based on spotify_api.py, the URL should be in track_data['album']['images'][0]['url']
+            if track_data.get('album') and track_data['album'].get('images'):
+                cover_url = track_data['album']['images'][0]['url']
+                return CoverInfo(
+                    url=cover_url,
+                    # Assuming JPEG, but the API might provide this. For now, this is a safe bet.
+                    file_type=ImageFileTypeEnum.jpg
+                )
+            else:
+                self.printer.oprint(f"No cover art found for track_id: {track_id}", drop_level=1)
+                return None
+
+        except SpotifyItemNotFoundError:
+            self.printer.oprint(f"Track with ID '{track_id}' not found.", drop_level=1)
+            return None
+        except SpotifyApiError as e:
+            self.module_error(f"An API error occurred while fetching the track cover for {track_id}: {e}")
+            return None
+        except Exception as e:
+            self.module_error(f"An unexpected error occurred in get_track_cover for {track_id}: {e}", drop_level=1)
+            if self.debug_mode:
+                print_exc()
+            return None
 
     def _fetch_stream_with_retries(self, track_id_core: str) -> Optional[dict]:
         """Helper to fetch track stream info with retry logic for librespot errors."""
