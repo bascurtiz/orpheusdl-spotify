@@ -1045,7 +1045,8 @@ class SpotifyAPI:
             elif qt_str == "HIGH":
                 librespot_audio_quality_mode = LibrespotAudioQualityEnum.HIGH
             elif qt_str == "LOW":
-                librespot_audio_quality_mode = LibrespotAudioQualityEnum.LOW
+                # LOW doesn't exist in librespot, map to NORMAL (lowest available quality)
+                librespot_audio_quality_mode = LibrespotAudioQualityEnum.NORMAL
             self.logger.info(f"Quality tier input: '{quality_tier}', resolved to string: '{qt_str}', mapped to librespot AudioQuality mode: {librespot_audio_quality_mode}")
             content_feeder = self.librespot_session.content_feeder()
             self.logger.info(f"Attempting to load track {track_id_hex} using content_feeder.load_track with VorbisOnlyAudioQuality.")
