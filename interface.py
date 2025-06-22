@@ -613,7 +613,7 @@ class ModuleInterface:
         # Ensure authentication before proceeding
         if not self._ensure_authenticated(context_message="get_artist_info"):
             return None
-        
+
         try:
             return self.spotify_api.get_artist_info(artist_id, metadata=metadata)
         except SpotifyApiError as e:
@@ -631,7 +631,7 @@ class ModuleInterface:
             track_data = self.spotify_api.get_track_by_id(track_id)
             if not track_data:
                 self.printer.oprint(f"Could not retrieve metadata for track_id: {track_id}", drop_level=1)
-                return None
+            return None
 
             # Extract cover URL from the track data
             # Based on spotify_api.py, the URL should be in track_data['album']['images'][0]['url']
@@ -656,7 +656,7 @@ class ModuleInterface:
             self.module_error(f"An unexpected error occurred in get_track_cover for {track_id}: {e}", drop_level=1)
             if self.debug_mode:
                 print_exc()
-            return None
+        return None
 
     def _fetch_stream_with_retries(self, track_id_core: str) -> Optional[dict]:
         """Helper to fetch track stream info with retry logic for librespot errors."""
@@ -702,39 +702,49 @@ class ModuleInterface:
         
         return stream_info
 
-    def get_track_download(self, **kwargs) -> Optional[TrackDownloadInfo]:
+    def get_track_download(self, track_id: str = None, quality_tier: QualityEnum = None, **kwargs) -> Optional[TrackDownloadInfo]:
         # Ensure authentication before proceeding
         if not self._ensure_authenticated("get_track_download"):
             self.logger.warning("Authentication failed in get_track_download, cannot proceed.")
             return None
 
+        # Handle both positional arguments (standard) and kwargs (legacy)
+        if track_id is None:
+            track_id = kwargs.get("track_id")
+        if quality_tier is None:
+            quality_tier = kwargs.get("quality_tier")
+            
         track_info = kwargs.get("track_info_obj")
-        quality_tier = kwargs.get("quality_tier")
+        
         # Essential arguments check for the interface layer's immediate needs
-        if not track_info or not quality_tier:
-            self.logger.error("ModuleInterface.get_track_download: Missing track_info_obj or quality_tier in provided kwargs.")
+        if not track_id or not quality_tier:
+            self.logger.error("ModuleInterface.get_track_download: Missing track_id or quality_tier.")
             return None
         try:
+            # Pass track_id and quality_tier along with other kwargs
+            kwargs['track_id'] = track_id
+            kwargs['quality_tier'] = quality_tier
             return self.spotify_api.get_track_download(**kwargs)
-        except SpotifyAuthError as e:
-            self.printer.oprint(f"Spotify authentication error during track download: {e}")
-            self.logger.error(f"SpotifyAuthError in get_track_download: {e}", exc_info=self.debug_mode)
-            return None
         except SpotifyRateLimitDetectedError as e:
-            self.printer.oprint(f"Spotify rate limit detected during track download: {e}")
+            # Don't print the full technical error message to the user - it will be handled by music_downloader.py
+            # self.printer.oprint(f"Spotify rate limit detected during track download: {e}", drop_level=0)
             self.logger.warning(f"SpotifyRateLimitDetectedError in get_track_download: {e}")
             # Re-raise to be caught by music_downloader.py for deferral
             raise
         except SpotifyTrackUnavailableError as e:
-            self.printer.oprint(f"Track is unavailable on Spotify: {e}")
+            self.printer.oprint(f"Track is unavailable on Spotify: {e}", drop_level=0)
             self.logger.warning(f"SpotifyTrackUnavailableError in get_track_download: {e}")
             return None # Or re-raise if music_downloader should handle it differently
+        except SpotifyAuthError as e:
+            self.printer.oprint(f"Spotify authentication error during track download: {e}", drop_level=0)
+            self.logger.error(f"SpotifyAuthError in get_track_download: {e}", exc_info=self.debug_mode)
+            return None
         except SpotifyApiError as e:
-            self.printer.oprint(f"Spotify API error during track download: {e}")
+            self.printer.oprint(f"Spotify API error during track download: {e}", drop_level=0)
             self.logger.error(f"SpotifyApiError in get_track_download: {e}", exc_info=self.debug_mode)
             return None
         except Exception as e:
-            self.printer.oprint(f"An unexpected error occurred during Spotify track download: {e}")
+            self.printer.oprint(f"An unexpected error occurred during Spotify track download: {e}", drop_level=0)
             self.logger.error(f"Unexpected exception in ModuleInterface.get_track_download: {e}", exc_info=True)
             return None
 

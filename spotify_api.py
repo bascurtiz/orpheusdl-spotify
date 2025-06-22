@@ -9,6 +9,9 @@ from typing import List, Optional, Tuple
 import tempfile
 import re
 from urllib.parse import urlparse
+import sys
+import io
+import contextlib
 
 # OAuth and HTTP server imports for Zotify-style authentication
 import webbrowser
@@ -107,6 +110,8 @@ DEFAULT_REQUEST_TIMEOUT = 15 # seconds
 DESKTOP_CLIENT_ID = "65b708073fc0480ea92a077233ca87bd" 
 SPOTIFY_TOKEN_URL = "https://api.spotify.com/api/token" 
 CREDENTIALS_FILE_NAME = "credentials.json"
+
+
 
 # --- PKCE Helper Functions ---
 def generate_code_verifier(length=64) -> str:
@@ -259,6 +264,7 @@ class OAuth:
         self.logger.info(f"Please authorize in your browser: {auth_url}")
         print(f"\nOpening browser for Spotify authorization...\nURL: {auth_url}")
         print(f"If the browser does not open, please copy the URL above and paste it manually.")
+        print()  # Add empty line after authorization messages
         try:
             webbrowser.open(auth_url)
         except Exception as e_wb:
@@ -438,6 +444,59 @@ class SpotifyApiTokenProvider(LibrespotTokenProvider):
             self.logger.error(f"CUSTOM_TP_DEBUG (Instance {self.instance_id}): Error creating StoredToken: {e}", exc_info=True)
             raise
 
+class LibrespotAudioKeyFilter(logging.Filter):
+    """Filter to suppress noisy librespot audio key error messages and rate limit warnings"""
+    def filter(self, record):
+        try:
+            message = record.getMessage()
+            message_lower = message.lower()
+            logger_name_lower = record.name.lower()
+            
+            # Comprehensive suppression of audio key error messages
+            suppress_patterns = [
+                'audio key error',
+                'failed fetching audio key',
+                'audiokeymanager',
+                'spotify rate limit detected during track download',
+                'rate limit suspected: failed fetching audio key'
+            ]
+            
+            # Check if any suppress pattern matches the message
+            for pattern in suppress_patterns:
+                if pattern in message_lower:
+                    return False
+            
+            # Additional check for CRITICAL level messages with specific content
+            if record.levelno >= logging.CRITICAL:
+                critical_suppress_patterns = [
+                    'audio key error',
+                    'failed fetching audio key',
+                    'code: 2'
+                ]
+                for pattern in critical_suppress_patterns:
+                    if pattern in message_lower:
+                        return False
+            
+            # Check logger name patterns
+            logger_suppress_patterns = [
+                'librespot',
+                'audiokeymanager'
+            ]
+            
+            for pattern in logger_suppress_patterns:
+                if pattern in logger_name_lower:
+                    # If it's from a librespot logger, check for audio key content
+                    if ('audio key' in message_lower or 
+                        'failed fetching' in message_lower or
+                        'code: 2' in message_lower):
+                        return False
+            
+            return True
+            
+        except Exception:
+            # If there's any error in filtering, allow the message through
+            return True
+
 class SpotifyAPI:
     logger = logging.getLogger(__name__)
 
@@ -457,6 +516,40 @@ class SpotifyAPI:
         self.oauth_handler: Optional[OAuth] = OAuth(CLIENT_ID, REDIRECT_URI, OAUTH_SCOPES, self.logger)
         self.stored_token: Optional[StoredToken] = None
         self.last_custom_provider_id_created: Optional[int] = None # ADDED FOR DIAGNOSTICS
+
+                # Set up logging filter to suppress noisy librespot messages
+        audio_key_filter = LibrespotAudioKeyFilter()
+        
+        # Apply filter to root logger
+        root_logger = logging.getLogger()
+        root_logger.addFilter(audio_key_filter)
+        
+        # Apply to all existing handlers on root logger
+        for handler in root_logger.handlers:
+            handler.addFilter(audio_key_filter)
+        
+        # Apply to all possible logger names that might be used by librespot
+        potential_logger_names = [
+            'librespot', 'Librespot', 'LIBRESPOT',
+            'librespot.core', 'Librespot.Core', 
+            'librespot.audio', 'Librespot.Audio',
+            'AudioKeyManager', 'audiokeymanager',
+            'spotify', 'Spotify', 'modules.spotify',
+            '__main__', 'root',
+            '', # Empty string for root logger edge cases
+        ]
+        
+        for logger_name in potential_logger_names:
+            logger = logging.getLogger(logger_name)
+            logger.addFilter(audio_key_filter)
+            # Also apply to any existing handlers on these loggers
+            for handler in logger.handlers:
+                handler.addFilter(audio_key_filter)
+        
+        # Store reference to reapply filter later if needed
+        self._audio_key_filter = audio_key_filter
+        
+        self.logger.debug("Added LibrespotAudioKeyFilter to suppress noisy audio key error messages and rate limit warnings")
 
         # Determine script directory for credentials.json - use config/spotify/ subdirectory        
         self.credentials_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "config", "spotify"))
@@ -1021,10 +1114,20 @@ class SpotifyAPI:
                     self.logger.warning(f"Error closing original stream object after saving: {close_err}")
 
     def get_track_download(self, **kwargs) -> Optional[TrackDownloadInfo]:
-        track_id_hex = kwargs.get("track_id_str")
+        track_id_base62 = kwargs.get("track_id_str") or kwargs.get("track_id")
         quality_tier = kwargs.get("quality_tier")
         download_options = kwargs.get("codec_options")
         track_info_obj = kwargs.get("track_info_obj")
+
+        if not track_id_base62:
+            self.logger.error("get_track_download: No track_id provided in kwargs")
+            raise SpotifyApiError("No track_id provided for download")
+
+        # Convert base62 track ID to hex GID format required by librespot
+        track_id_hex = self._convert_base62_to_gid_hex(track_id_base62)
+        if not track_id_hex:
+            self.logger.error(f"Failed to convert track_id '{track_id_base62}' to hex GID format")
+            raise SpotifyApiError(f"Failed to convert track_id '{track_id_base62}' to hex GID format")
 
         if not self._is_session_valid(self.librespot_session):
             self.logger.error("Librespot session is not active or not logged in for track download.")
@@ -1040,7 +1143,7 @@ class SpotifyAPI:
                 qt_str = quality_tier.name.upper()
             elif isinstance(quality_tier, str):
                 qt_str = quality_tier.upper()
-            if qt_str == "HIFI" or qt_str == "VERY_HIGH":
+            if qt_str == "LOSSLESS" or qt_str == "HIFI" or qt_str == "VERY_HIGH":
                 librespot_audio_quality_mode = LibrespotAudioQualityEnum.VERY_HIGH
             elif qt_str == "HIGH":
                 librespot_audio_quality_mode = LibrespotAudioQualityEnum.HIGH
@@ -1048,6 +1151,13 @@ class SpotifyAPI:
                 # LOW doesn't exist in librespot, map to NORMAL (lowest available quality)
                 librespot_audio_quality_mode = LibrespotAudioQualityEnum.NORMAL
             self.logger.info(f"Quality tier input: '{quality_tier}', resolved to string: '{qt_str}', mapped to librespot AudioQuality mode: {librespot_audio_quality_mode}")
+            # Ensure our audio key filter is still active before librespot operations
+            if hasattr(self, '_audio_key_filter'):
+                # Reapply filter to ensure it's active for this operation
+                for handler in logging.getLogger().handlers:
+                    if self._audio_key_filter not in handler.filters:
+                        handler.addFilter(self._audio_key_filter)
+            
             content_feeder = self.librespot_session.content_feeder()
             self.logger.info(f"Attempting to load track {track_id_hex} using content_feeder.load_track with VorbisOnlyAudioQuality.")
             stream_loader = content_feeder.load_track(
@@ -1098,8 +1208,11 @@ class SpotifyAPI:
             raise 
         except RuntimeError as rt_err:
             if "Failed fetching audio key!" in str(rt_err):
-                self.logger.warning(f"Rate limit suspected for track {track_id_hex} due to audio key error: {rt_err}")
-                raise SpotifyRateLimitDetectedError(f"Rate limit suspected: {rt_err}") from rt_err
+                # Suppress the noisy warning message - it's handled by the rate limit detection
+                # self.logger.warning(f"Rate limit suspected for track {track_id_hex} due to audio key error: {rt_err}")
+                # Clean up the error message by removing technical details (gid, fileId)
+                clean_error_msg = "Failed fetching audio key!"
+                raise SpotifyRateLimitDetectedError(f"Rate limit suspected: {clean_error_msg}") from rt_err
             elif str(rt_err) == "Cannot get alternative track":
                 self.logger.warning(f"Track {track_id_hex} is unavailable (librespot: Cannot get alternative track).")
                 raise SpotifyTrackUnavailableError(f"Track {track_id_hex} is unavailable (Cannot get alternative track)") from rt_err
