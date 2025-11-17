@@ -13,6 +13,9 @@ import sys
 import io
 import contextlib
 
+from utils.vendor_bootstrap import bootstrap_vendor_paths
+bootstrap_vendor_paths()
+
 # OAuth and HTTP server imports for Zotify-style authentication
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -1841,6 +1844,405 @@ class SpotifyAPI:
             return artist_info_obj
         except Exception as e_artist_info_create:
             self.logger.error(f"SpotifyAPI.get_artist_info: Error creating ArtistInfo object for {artist_name} ({artist_id}): {e_artist_info_create}", exc_info=True)
+            return None
+
+    def get_show_info(self, show_id: str, metadata: Optional['AlbumInfo'] = None, _retry_attempted: bool = False) -> Optional[dict]:
+        """Get show information from Spotify API. Returns show data in album-like format for compatibility."""
+        self.logger.info(f"SpotifyAPI: Attempting to get show info for ID: {show_id}{' (retry)' if _retry_attempted else ''}")
+
+        if not self.stored_token or not self.stored_token.access_token or self.stored_token.expired():
+            self.logger.info("SpotifyAPI.get_show_info: Token missing, invalid or expired. Attempting to load/refresh session.")
+            if not self._load_credentials_and_init_session():
+                self.logger.error("SpotifyAPI.get_show_info: Session initialization failed.")
+                raise SpotifyAuthError("Authentication required/failed for get_show_info. Session could not be initialized.")
+        
+        if not self.stored_token or not self.stored_token.access_token:
+            self.logger.error("SpotifyAPI.get_show_info: Still no access token after session initialization attempt.")
+            raise SpotifyAuthError("Authentication failed for get_show_info. No valid token.")
+
+        # First get basic show information
+        api_url = f"https://api.spotify.com/v1/shows/{show_id}"
+        headers = {"Authorization": f"Bearer {self.stored_token.access_token}"}
+        params = {}
+        if self.user_market:
+            params['market'] = self.user_market
+
+        try:
+            self.logger.debug(f"SpotifyAPI.get_show_info: Making GET request to {api_url} with params {params}")
+            response = requests.get(api_url, headers=headers, params=params, timeout=DEFAULT_REQUEST_TIMEOUT)
+
+            if response.status_code == 200:
+                show_data = response.json()
+                self.logger.info(f"SpotifyAPI.get_show_info: Successfully retrieved show data for {show_id}")
+                
+                # Now get all episodes for the show using separate endpoint
+                episodes_list = []
+                episodes_api_url = f"https://api.spotify.com/v1/shows/{show_id}/episodes"
+                episodes_params = {'limit': 50}  # Maximum limit per request
+                if self.user_market:
+                    episodes_params['market'] = self.user_market
+                
+                current_episodes_url = episodes_api_url
+                
+                while current_episodes_url:
+                    self.logger.debug(f"SpotifyAPI.get_show_info: Fetching episodes from {current_episodes_url}")
+                    current_headers = {"Authorization": f"Bearer {self.stored_token.access_token}"}
+                    
+                    try:
+                        episodes_response = requests.get(current_episodes_url, headers=current_headers, params=episodes_params, timeout=DEFAULT_REQUEST_TIMEOUT)
+                        episodes_response.raise_for_status()
+                        episodes_data = episodes_response.json()
+                        
+                        episodes_items = episodes_data.get('items', [])
+                        
+                        for episode in episodes_items:
+                            episode_id = episode.get('id')
+                            if episode_id:
+                                episodes_list.append(episode_id)
+                        
+                        # Check for next page
+                        current_episodes_url = episodes_data.get('next')
+                        if current_episodes_url:
+                            episodes_params = {}  # URL already contains the parameters for next page
+                        
+                    except requests.exceptions.HTTPError as http_err:
+                        self.logger.error(f"HTTP error fetching episodes for show {show_id}: {http_err.response.status_code} - {http_err.response.text[:200]}")
+                        break
+                    except Exception as e:
+                        self.logger.error(f"Error fetching episodes for show {show_id}: {e}")
+                        break
+                
+                # Convert to album-like format
+                album_data = {
+                    'id': show_id,
+                    'name': show_data.get('name', 'Unknown Show'),
+                    'publisher': show_data.get('publisher', 'Unknown Publisher'),
+                    'description': show_data.get('description', ''),
+                    'total_tracks': len(episodes_list),
+                    'tracks': episodes_list,  # List of episode IDs
+                    'images': show_data.get('images', []),
+                    'type': 'show'
+                }
+                
+                return album_data
+            elif response.status_code == 401:
+                self.logger.warning(f"SpotifyAPI.get_show_info: Authorization error (401) for {show_id}. Token might be invalid.")
+                if not _retry_attempted:
+                    self.logger.info("SpotifyAPI.get_show_info: Attempting re-authentication and retry for 401.")
+                    self.stored_token = None
+                    if self._perform_oauth_flow():
+                        self.logger.info("SpotifyAPI.get_show_info: Re-authentication successful. Retrying original call.")
+                        return self.get_show_info(show_id, metadata, _retry_attempted=True)
+                    else:
+                        self.logger.error("SpotifyAPI.get_show_info: Re-authentication failed after 401.")
+                        raise SpotifyAuthError(f"Re-authentication failed for show {show_id} after 401.")
+                else:
+                    self.logger.error(f"SpotifyAPI.get_show_info: Authorization error (401) for {show_id} even after retry.")
+                    raise SpotifyAuthError(f"Authorization failed for show {show_id} (401) after retry.")
+            elif response.status_code == 404:
+                self.logger.warning(f"SpotifyAPI.get_show_info: Show {show_id} not found (404).")
+                raise SpotifyItemNotFoundError(f"Show with ID {show_id} not found.")
+            else:
+                self.logger.error(f"SpotifyAPI.get_show_info: Failed to get show data for {show_id}. Status: {response.status_code}, Response: {response.text}")
+                raise SpotifyApiError(f"Failed to get show data for {show_id}. Status: {response.status_code}, Response Text: {response.text[:200]}")
+
+        except requests.exceptions.HTTPError as http_err:
+            if http_err.response.status_code == 401:
+                self.logger.warning(f"SpotifyAPI.get_show_info: HTTPError 401 caught for {show_id}.")
+                if not _retry_attempted:
+                    self.logger.info("SpotifyAPI.get_show_info: Attempting re-authentication and retry for HTTPError 401.")
+                    self.stored_token = None
+                    if self._perform_oauth_flow():
+                        self.logger.info("SpotifyAPI.get_show_info: Re-authentication successful. Retrying original call.")
+                        return self.get_show_info(show_id, metadata, _retry_attempted=True)
+                    else:
+                        self.logger.error("SpotifyAPI.get_show_info: Re-authentication failed after HTTPError 401.")
+                        raise SpotifyAuthError(f"Re-authentication failed for show {show_id} after HTTPError 401.")
+                else:
+                    self.logger.error(f"SpotifyAPI.get_show_info: HTTPError 401 for {show_id} even after retry.")
+                    raise SpotifyAuthError(f"Authorization failed for show {show_id} (HTTPError 401) after retry.")
+            else:
+                self.logger.error(f"SpotifyAPI.get_show_info: HTTPError {http_err.response.status_code} for {show_id}: {http_err.response.text[:200]}")
+                raise SpotifyApiError(f"HTTP error fetching show {show_id}: {http_err.response.status_code} - {http_err.response.text[:200]}") from http_err
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"SpotifyAPI.get_show_info: RequestException for {show_id}: {e}", exc_info=False)
+            raise SpotifyApiError(f"Network error while fetching show {show_id}: {e}")
+        except SpotifyAuthError:
+            raise
+        except Exception as e:
+            self.logger.error(f"SpotifyAPI.get_show_info: Unexpected error for {show_id}: {e}", exc_info=True)
+            if isinstance(e, SpotifyApiError):
+                raise
+            raise SpotifyApiError(f"An unexpected error occurred while fetching show {show_id}: {e}")
+
+    def get_episode_by_id(self, episode_id: str, market: Optional[str] = None, _retry_attempted: bool = False) -> Optional[dict]:
+        """Get episode details by its Spotify ID using the Web API."""
+        self.logger.debug(f"SpotifyAPI.get_episode_by_id entered for episode_id: {episode_id}, market: {market}{', retry' if _retry_attempted else ''}")
+
+        if not self.stored_token or not self.stored_token.access_token or self.stored_token.expired():
+            self.logger.info("SpotifyAPI.get_episode_by_id: Token missing, invalid or expired. Attempting to load/refresh session.")
+            if not self._load_credentials_and_init_session():
+                self.logger.error("SpotifyAPI.get_episode_by_id: Session initialization failed.")
+                raise SpotifyAuthError("Authentication required/failed for get_episode_by_id. Session could not be initialized.")
+
+        if not self.stored_token or not self.stored_token.access_token:
+            self.logger.error("SpotifyAPI.get_episode_by_id: Still no access token after session initialization attempt.")
+            raise SpotifyAuthError("Authentication failed for get_episode_by_id. No valid token.")
+
+        headers = {"Authorization": f"Bearer {self.stored_token.access_token}"}
+        params = {}
+        if market:
+            params["market"] = market
+        elif self.user_market:
+            params["market"] = self.user_market
+
+        api_url = f"https://api.spotify.com/v1/episodes/{episode_id}"
+        self.logger.debug(f"Calling Spotify Web API: GET {api_url} with params: {params}")
+        try:
+            response = requests.get(api_url, headers=headers, params=params, timeout=DEFAULT_REQUEST_TIMEOUT)
+            self.logger.debug(f"Episode API response status: {response.status_code}")
+            response.raise_for_status()  # Will raise HTTPError for 4xx/5xx status codes
+            episode_data = response.json()
+            self.logger.debug(f"get_episode_by_id SUCCEEDED for episode_id: {episode_id}. Data keys: {list(episode_data.keys())}")
+            return episode_data
+        except requests.exceptions.HTTPError as http_err:
+            if http_err.response.status_code == 401:
+                self.logger.warning(f"SpotifyAPI.get_episode_by_id: Auth error (401) for episode {episode_id}. Token might be invalid.")
+                if not _retry_attempted:
+                    self.logger.info("SpotifyAPI.get_episode_by_id: Attempting re-auth and retry for 401.")
+                    self.stored_token = None  # Invalidate current token
+                    if self._perform_oauth_flow():
+                        self.logger.info("SpotifyAPI.get_episode_by_id: Re-auth successful. Retrying call.")
+                        return self.get_episode_by_id(episode_id, market, _retry_attempted=True)
+                    else:
+                        self.logger.error("SpotifyAPI.get_episode_by_id: Re-auth failed after 401.")
+                        raise SpotifyAuthError(f"Re-authentication failed for episode {episode_id} after 401.")
+                else:
+                    self.logger.error(f"SpotifyAPI.get_episode_by_id: Auth error (401) for episode {episode_id} after retry.")
+                    raise SpotifyAuthError(f"Auth failed for episode {episode_id} (401) after retry.")
+            elif http_err.response.status_code == 404:
+                self.logger.warning(f"Episode {episode_id} not found via Spotify API (404).")
+                raise SpotifyItemNotFoundError(f"Episode {episode_id} not found.") from http_err
+            elif http_err.response.status_code == 403:
+                self.logger.warning(f"Episode {episode_id} access forbidden (403) - might be region locked or premium only.")
+                raise SpotifyItemNotFoundError(f"Episode {episode_id} access forbidden.") from http_err
+            else:
+                self.logger.error(f"HTTP error fetching episode {episode_id}: {http_err.response.status_code} - {http_err.response.text[:200]}", exc_info=False)
+                raise SpotifyApiError(f"Spotify API request failed for episode {episode_id}: {http_err.response.status_code} - {http_err.response.text[:200]}") from http_err
+        except requests.exceptions.RequestException as req_err:
+            self.logger.error(f"Request error fetching episode {episode_id}: {req_err}", exc_info=True)
+            raise SpotifyApiError(f"Request failed for episode {episode_id}: {req_err}") from req_err
+        except Exception as e:
+            self.logger.error(f"Unexpected error fetching episode {episode_id}: {e}", exc_info=True)
+            if isinstance(e, SpotifyApiError):
+                raise
+            raise SpotifyApiError(f"An unexpected error occurred while fetching episode {episode_id}: {e}")
+
+    def get_episode_download(self, **kwargs) -> Optional[TrackDownloadInfo]:
+        """Download episode audio using librespot. Same approach as get_track_download but for episodes."""
+        episode_id_base62 = kwargs.get("track_id_str") or kwargs.get("track_id") or kwargs.get("episode_id")
+        quality_tier = kwargs.get("quality_tier")
+        download_options = kwargs.get("codec_options")
+        track_info_obj = kwargs.get("track_info_obj")
+
+        if not episode_id_base62:
+            self.logger.error("get_episode_download: No episode_id provided in kwargs")
+            raise SpotifyApiError("No episode_id provided for download")
+
+        # Convert base62 episode ID to hex GID format required by librespot
+        episode_id_hex = self._convert_base62_to_gid_hex(episode_id_base62)
+        if not episode_id_hex:
+            self.logger.error(f"Failed to convert episode_id '{episode_id_base62}' to hex GID format")
+            raise SpotifyApiError(f"Failed to convert episode_id '{episode_id_base62}' to hex GID format")
+
+        if not self._is_session_valid(self.librespot_session):
+            self.logger.error("Librespot session is not active or not logged in for episode download.")
+            if not self._load_credentials_and_init_session() or not self._is_session_valid(self.librespot_session):
+                 raise SpotifyAuthError("Authentication required/failed for episode download.")
+        
+        # Try using TrackId with episode hex - librespot might handle episodes as tracks internally
+        track_id_obj = TrackId.from_hex(episode_id_hex)
+        temp_file_path = None
+        try:
+            self.logger.info(f"Fetching librespot Episode metadata for GID hex: {episode_id_hex}")
+            librespot_audio_quality_mode = LibrespotAudioQualityEnum.NORMAL
+            qt_str = None
+            if hasattr(quality_tier, 'name'):
+                qt_str = quality_tier.name.upper()
+            elif isinstance(quality_tier, str):
+                qt_str = quality_tier.upper()
+            if qt_str == "LOSSLESS" or qt_str == "HIFI" or qt_str == "VERY_HIGH":
+                librespot_audio_quality_mode = LibrespotAudioQualityEnum.VERY_HIGH
+            elif qt_str == "HIGH":
+                librespot_audio_quality_mode = LibrespotAudioQualityEnum.HIGH
+            elif qt_str == "LOW":
+                # LOW doesn't exist in librespot, map to NORMAL (lowest available quality)
+                librespot_audio_quality_mode = LibrespotAudioQualityEnum.NORMAL
+            self.logger.info(f"Quality tier input: '{quality_tier}', resolved to string: '{qt_str}', mapped to librespot AudioQuality mode: {librespot_audio_quality_mode}")
+            
+            # Ensure our audio key filter is still active before librespot operations
+            if hasattr(self, '_audio_key_filter'):
+                # Reapply filter to ensure it's active for this operation
+                for handler in logging.getLogger().handlers:
+                    if self._audio_key_filter not in handler.filters:
+                        handler.addFilter(self._audio_key_filter)
+            
+            content_feeder = self.librespot_session.content_feeder()
+            self.logger.info(f"Attempting to load episode {episode_id_hex} using content_feeder.load_track with VorbisOnlyAudioQuality.")
+            stream_loader = content_feeder.load_track(
+                track_id_obj,
+                VorbisOnlyAudioQuality(librespot_audio_quality_mode),
+                False, 
+                None   
+            )
+            if not stream_loader or not hasattr(stream_loader, 'input_stream') or not stream_loader.input_stream:
+                self.logger.error(f"Librespot returned no stream_loader or input_stream for episode {episode_id_hex} (TrackId: {str(track_id_obj)}).")
+                try:
+                    track_metadata_check = track_id_obj.get(self.librespot_session)
+                    if track_metadata_check and not track_metadata_check.file:
+                         self.logger.error(f"Additionally, episode metadata for GID {episode_id_hex} has no associated audio files.")
+                         raise SpotifyTrackUnavailableError(f"No audio files listed for episode GID {episode_id_hex} and stream_loader failed.")
+                    elif not track_metadata_check:
+                         self.logger.error(f"Additionally, failed to get any episode metadata from librespot for GID hex: {episode_id_hex}")
+                except Exception as meta_err:
+                     self.logger.error(f"Error during additional metadata check for {episode_id_hex} after stream_loader failure: {meta_err}")
+                raise SpotifyTrackUnavailableError(f"Failed to load audio stream (no stream_loader or input_stream) for episode GID {episode_id_hex}")
+            
+            raw_audio_byte_stream = stream_loader.input_stream.stream()
+            temp_file_path = self._save_stream_to_temp_file(raw_audio_byte_stream, CodecEnum.VORBIS)
+            if not temp_file_path:
+                self.logger.error(f"Failed to save downloaded stream for episode GID {episode_id_hex} to a temp file.")
+                if hasattr(stream_loader, 'input_stream') and stream_loader.input_stream and hasattr(stream_loader.input_stream, 'close'):
+                    try:
+                        stream_loader.input_stream.close()
+                    except Exception as close_ex:
+                        self.logger.warning(f"Exception while closing input_stream after save failure for episode {episode_id_hex}: {close_ex}")
+                return None
+            
+            self.logger.info(f"Successfully downloaded episode {episode_id_hex} to {temp_file_path}")
+            if track_info_obj and hasattr(track_info_obj, 'codec'):
+                self.logger.info(f"Updating track_info_obj.codec to VORBIS for episode: {track_info_obj.name if hasattr(track_info_obj, 'name') else episode_id_hex}")
+                track_info_obj.codec = CodecEnum.VORBIS
+            elif track_info_obj:
+                self.logger.warning(f"track_info_obj for {episode_id_hex} provided but has no 'codec' attribute to update.")
+            
+            return TrackDownloadInfo(
+                download_type=DownloadEnum.TEMP_FILE_PATH,
+                temp_file_path=temp_file_path,
+            )
+        except SpotifyAuthError: 
+            raise
+        except SpotifyTrackUnavailableError as e: 
+            self.logger.warning(f"Episode {episode_id_hex} is unavailable for download: {e}")
+            raise 
+        except SpotifyItemNotFoundError as e: 
+            self.logger.warning(f"Episode metadata for {episode_id_hex} not found: {e}")
+            raise 
+        except RuntimeError as rt_err:
+            if "Failed fetching audio key!" in str(rt_err):
+                # Suppress the noisy warning message - it's handled by the rate limit detection
+                clean_error_msg = "Failed fetching audio key!"
+                raise SpotifyRateLimitDetectedError(f"Rate limit suspected: {clean_error_msg}") from rt_err
+            elif str(rt_err) == "Cannot get alternative track":
+                self.logger.warning(f"Episode {episode_id_hex} is unavailable (librespot: Cannot get alternative track).")
+                raise SpotifyTrackUnavailableError(f"Episode {episode_id_hex} is unavailable (Cannot get alternative track)") from rt_err
+            else:
+                self.logger.error(f"Unhandled RuntimeError during get_episode_download for {episode_id_hex}: {rt_err}", exc_info=True)
+                raise SpotifyApiError(f"Runtime error during episode download {episode_id_hex}: {rt_err}") from rt_err
+        except Exception as e:
+            self.logger.error(f"Unexpected error during get_episode_download for {episode_id_hex}: {e}", exc_info=True)
+            if temp_file_path and os.path.exists(temp_file_path):
+                try:
+                    os.unlink(temp_file_path)
+                    self.logger.info(f"Cleaned up temp file {temp_file_path} after error in get_episode_download.")
+                except OSError as unlink_e:
+                    self.logger.error(f"Error unlinking temp file {temp_file_path} during error handling: {unlink_e}")
+            raise SpotifyApiError(f"Failed to download episode {episode_id_hex}: {e}") from e
+
+    def get_episode_info(self, episode_id: str, quality_tier: QualityEnum, codec_options: CodecOptions, **extra_kwargs) -> Optional[TrackInfo]:
+        """Get episode information and convert to TrackInfo format for compatibility."""
+        self.logger.info(f"SpotifyAPI: get_episode_info for episode_id: {episode_id}")
+        
+        try:
+            # Get episode data from API
+            self.logger.debug(f"Calling get_episode_by_id for {episode_id}")
+            episode_data = self.get_episode_by_id(episode_id)
+            if not episode_data:
+                self.logger.error(f"No episode data returned for episode_id: {episode_id}")
+                return None
+            
+            self.logger.debug(f"Episode data keys: {list(episode_data.keys())}")
+            
+            # Convert episode data to TrackInfo format
+            track_name = episode_data.get('name', 'Unknown Episode')
+            description = episode_data.get('description', '')
+            duration_ms = episode_data.get('duration_ms', 0)
+            explicit = episode_data.get('explicit', False)
+            release_date = episode_data.get('release_date', '')
+            
+            self.logger.debug(f"Episode basic info - Name: {track_name}, Duration: {duration_ms}ms")
+            
+            # Get show (album) information
+            show_data = episode_data.get('show', {})
+            album_name = show_data.get('name', 'Unknown Show')
+            album_id = show_data.get('id', None)
+            publisher = show_data.get('publisher', 'Unknown Publisher')
+            
+            self.logger.debug(f"Show info - Name: {album_name}, Publisher: {publisher}")
+            
+            # Use publisher as artist
+            artists = [publisher] if publisher else ['Unknown Publisher']
+            artist_id = None  # Shows don't have artist IDs
+            
+            # Get cover art
+            cover_url = None
+            if show_data.get('images') and len(show_data['images']) > 0:
+                cover_url = show_data['images'][0].get('url')
+                self.logger.debug(f"Using show cover: {cover_url}")
+            elif episode_data.get('images') and len(episode_data['images']) > 0:
+                cover_url = episode_data['images'][0].get('url')
+                self.logger.debug(f"Using episode cover: {cover_url}")
+            
+            # Parse release year
+            release_year = 0
+            if release_date and len(release_date) >= 4:
+                try:
+                    release_year = int(release_date[:4])
+                except ValueError:
+                    self.logger.warning(f"Could not parse year from release_date: {release_date}")
+            
+            # Create Tags object
+            self.logger.debug("Creating Tags object")
+            tags = Tags()
+            tags.album_artist = publisher
+            tags.release_date = release_date
+            tags.disc_number = 1
+            tags.track_number = 1
+            
+            # Create TrackInfo object with episode data
+            self.logger.debug("Creating TrackInfo object")
+            track_info = TrackInfo(
+                name=track_name,
+                id=episode_id,  # Add the episode ID so album download can access it
+                album_id=album_id,
+                album=album_name,
+                artists=artists,
+                artist_id=artist_id,
+                release_year=release_year,
+                explicit=explicit,
+                cover_url=cover_url,
+                tags=tags,
+                codec=CodecEnum.VORBIS,  # Episodes will be downloaded as VORBIS
+                duration=int(duration_ms / 1000) if duration_ms else 0,
+                # Add episode-specific info in error field for debugging
+                error=None
+            )
+            
+            self.logger.info(f"Successfully converted episode '{track_name}' to TrackInfo format")
+            return track_info
+            
+        except Exception as e:
+            self.logger.error(f"Error getting episode info for {episode_id}: {e}", exc_info=True)
             return None
 
 # --- Main function for testing or standalone use (Optional) ---

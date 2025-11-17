@@ -6,6 +6,7 @@ A Spotify module for the OrpheusDL modular archival music program
 
 1.  **Spotify Premium Account:** Essential for accessing audio streams in high quality.
 2.  **OrpheusDL:** [My fork](https://github.com/bascurtiz/orpheusdl) is needed to make Spotify's module work.
+3.  **Vendored Librespot:** A patched copy of `librespot-python` ships inside `vendor/librespot`, so you no longer need to install it from pip. This avoids protobuf version conflicts with other modules such as Apple Music.
 
 ## Installation
 

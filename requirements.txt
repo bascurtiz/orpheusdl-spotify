@@ -1,3 +1,3 @@
 # Requirements for the OrpheusDL Spotify module
-librespot @ git+https://github.com/justin025/librespot-python.git
+# Librespot is now vendored in the root `vendor/librespot` directory.
 pkce>=1.0.3
