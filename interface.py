@@ -101,7 +101,9 @@ module_information = ModuleInformation(
     login_behaviour=ManualEnum.manual,
     global_settings={
         "username": "",
-        "download_pause_seconds": 30
+        "download_pause_seconds": 30,
+        "client_id": "",
+        "client_secret": ""
     },
     session_settings={},
     module_supported_modes=[
@@ -113,7 +115,9 @@ module_information = ModuleInformation(
         "track": DownloadTypeEnum.track,
         "album": DownloadTypeEnum.album,
         "playlist": DownloadTypeEnum.playlist,
-        "artist": DownloadTypeEnum.artist
+        "artist": DownloadTypeEnum.artist,
+        "show": DownloadTypeEnum.album,
+        "episode": DownloadTypeEnum.track
     },
     url_decoding=ManualEnum.orpheus,
     global_storage_variables=[],
@@ -129,6 +133,7 @@ class ModuleInterface:
         self.settings = module_controller.module_settings
         self.module_error = module_controller.module_error
         self.printer = module_controller.printer_controller
+        
         self.spotify_api = SpotifyAPI(config=self.settings, module_controller=module_controller)
         self.logged_in = False # Initialize login status
         self.logger = logging.getLogger(__name__)
@@ -169,7 +174,23 @@ class ModuleInterface:
                 
                 if not auth_attempt_result:
                     self.logger.warning(f"[{context_message}] authenticate_stream_api (non-forced) indicated failure. Setting logged_in=False.")
-                    self.printer.oprint("Spotify authentication failed or session could not be refreshed silently.")
+                    # Check if there's a more specific error message from OAuth handler
+                    oauth_error = None
+                    if (self.spotify_api.librespot_oauth_handler and 
+                        hasattr(self.spotify_api.librespot_oauth_handler, 'error_message') and 
+                        self.spotify_api.librespot_oauth_handler.error_message):
+                        oauth_error = self.spotify_api.librespot_oauth_handler.error_message
+                    
+                    credentials_path = self.spotify_api.credentials_file_path
+                    if oauth_error:
+                        error_msg = f"Spotify authentication failed: {oauth_error}\n\n"
+                    else:
+                        error_msg = "Spotify authentication failed or session could not be refreshed.\nYour tokens may have expired.\n\n"
+                    
+                    error_msg += f"If this problem persists, try manually deleting the credentials file:\n{credentials_path}\n"
+                    error_msg += "Then run the command again to trigger a fresh authentication."
+                    
+                    self.printer.oprint(error_msg)
                     self.logged_in = False
                     if self.debug_mode:
                         self.logger.info(f"[{context_message}] _ensure_authenticated returning False (auth_attempt_result was False).")
@@ -430,89 +451,37 @@ class ModuleInterface:
             self.printer.oprint(f"An unexpected error occurred during Spotify search: {e}")
             return []
 
-    def get_track_info(self, track_id: str, quality_tier: QualityEnum = QualityEnum.HIGH, metadata: Optional[TrackInfo] = None) -> Optional[TrackInfo]:
-        operation_name = f"get track info for ID {track_id}"
-        self.logger.info(f"Interface get_track_info ORIGINAL track_id param type: {type(track_id)}, value: {track_id}")
-
-        if not self._ensure_authenticated(operation_name):
-            self.printer.oprint("Spotify authentication required. Please login first.")
+    def get_track_info(self, track_id: str, quality_tier: QualityEnum, codec_options: CodecOptions, **extra_kwargs) -> Optional[TrackInfo]:
+        """Fetches track information and parses it into a TrackInfo object. Also handles episode IDs via fallback."""
+        self.logger.info(f"Getting track info for ID: {track_id} (called from interface)")
+        
+        try:
+            # First, attempt to get track info from spotify_api
+            track_info_result = self.spotify_api.get_track_info(track_id, quality_tier, codec_options, **extra_kwargs)
+            if track_info_result:
+                self.logger.info(f"Successfully retrieved TrackInfo for track ID: {track_id}, Name: {track_info_result.name}")
+                return track_info_result
+            
+            # If track_info_result is None, try episode fallback
+            self.logger.info(f"Track info returned None for {track_id}, trying as episode...")
+            episode_info_result = self.spotify_api.get_episode_info(track_id, quality_tier, codec_options, **extra_kwargs)
+            if episode_info_result:
+                self.logger.info(f"Successfully fetched episode as TrackInfo object for ID: {track_id}")
+                return episode_info_result
+            
+            # If both failed, return None
+            self.logger.warning(f"Failed to get track or episode info for ID: {track_id}")
+            return None
+            
+        except SpotifyItemNotFoundError:
+            self.logger.warning(f"Track/Episode ID {track_id} not found")
+            return None
+        except Exception as e:
+            self.logger.error(f"Error getting track/episode info for {track_id}: {e}")
             return None
 
-        # Attempt to retrieve from cache first if ID is a string and not a URL
-        if isinstance(track_id, str) and not self.spotify_api.is_spotify_url(track_id) and track_id in self.metadata_cache['track']:
-            self.logger.info(f"Returning cached TrackInfo for ID: {track_id}")
-            return self.metadata_cache['track'][track_id]
-
-        try:
-            parsed_url_info = None
-            if isinstance(track_id, str) and self.spotify_api.is_spotify_url(track_id):
-                parsed_url_info = self.spotify_api.parse_spotify_url(track_id)
-                if parsed_url_info and parsed_url_info.get('type') == 'track' and parsed_url_info.get('id'):
-                    track_id = parsed_url_info.get('id') # Use the ID from the URL
-                    self.logger.info(f"Extracted track ID {track_id} from URL.")
-                else:
-                    self.logger.error(f"Could not parse track ID from Spotify URL: {track_id}")
-                    return None
-
-            # Construct CodecOptions from settings if possible            
-            proprietary_codecs_setting = False # Ensure default initialization
-            spatial_codecs_setting = False # Ensure default initialization
-            if self.settings and 'codecs' in self.settings:
-                proprietary_codecs_setting = self.settings['codecs'].get('proprietary_codecs', False)
-                spatial_codecs_setting = self.settings['codecs'].get('spatial_codecs', False)
-            else:
-                if self.debug_mode:
-                    self.logger.warning("Codec settings not found in self.settings. Using default False for proprietary/spatial codecs.")
-            
-            current_codec_options = CodecOptions(
-                proprietary_codecs=proprietary_codecs_setting,
-                spatial_codecs=spatial_codecs_setting
-            )
-            self.logger.info(f"Constructed CodecOptions: proprietary={proprietary_codecs_setting}, spatial={spatial_codecs_setting}")
-            
-            # Call the spotify_api.get_track_info method which returns a TrackInfo object directly.
-            self.logger.info(f"Calling self.spotify_api.get_track_info with ID: {track_id}, quality: {quality_tier.name if hasattr(quality_tier, 'name') else quality_tier}")
-            
-            # Ensure track_id is indeed a string before calling the API method
-            if not isinstance(track_id, str):
-                self.logger.error(f"Track ID must be a string for spotify_api.get_track_info, but got {type(track_id)}. Value: {track_id}")
-                return None
-
-            # Call the method in spotify_api.py that returns a TrackInfo object
-            fetched_track_info_object = self.spotify_api.get_track_info(
-                track_id=track_id, 
-                quality_tier=quality_tier, 
-                codec_options=current_codec_options
-                # **extra_kwargs can be added if interface.py's get_track_info had them
-            )
-
-            if fetched_track_info_object:
-                self.logger.info(f"Successfully fetched and parsed TrackInfo object for ID: {track_id} - Name: {fetched_track_info_object.name}")
-                self.metadata_cache['track'][track_id] = fetched_track_info_object
-                return fetched_track_info_object
-            else:
-                # The spotify_api.get_track_info method will have logged its own errors and DEBUG prints.
-                self.logger.error(f"self.spotify_api.get_track_info returned None for ID: {track_id}. This indicates failure within the API module's method.")
-                # No need for a redundant error print here unless it's specific to the interface layer.                
-                return None
-
-        except SpotifyItemNotFoundError:
-            self.logger.warning(f"Track with ID '{track_id}' not found (SpotifyItemNotFoundError caught in interface.py).")
-        except SpotifyAuthError as e:
-            self.logger.error(f"Spotify authentication error in get_track_info: {e}")
-            self.printer.oprint(f"Spotify authentication error: {e}")
-        except SpotifyApiError as e: # Broader Spotify API errors
-            self.logger.error(f"Spotify API error in get_track_info for '{track_id}': {e}", exc_info=True)
-            self.printer.oprint(f"Spotify API error: {e}")
-        except Exception as e:
-            self.logger.error(f"Unexpected error in get_track_info for '{track_id}': {e}", exc_info=True)
-            self.printer.oprint(f"An unexpected error occurred: {e}")
-
-        self.logger.error(f"get_track_info in interface.py returning None at the very end for track_id: {track_id}")
-        return None
-
     def get_album_info(self, album_id, metadata: Optional[AlbumInfo] = None) -> Optional[AlbumInfo]:
-        """Fetches album information and parses it into an AlbumInfo object."""
+        """Fetches album information and parses it into an AlbumInfo object. Also handles show IDs."""
         self.logger.info(f"Getting album info for ID: {album_id} (called from interface)")
 
         actual_album_id_str = None
@@ -534,23 +503,54 @@ class ModuleInterface:
                 self.logger.error(f"Authentication failed for get_album_info with ID: {actual_album_id_str}")
                 return None
 
-            # Call the API method (which should return a dictionary)
-            album_dict = self.spotify_api.get_album_info(actual_album_id_str, metadata)
-            if not album_dict:
-                self.logger.warning(f"Could not retrieve album dict for ID: {actual_album_id_str} from spotify_api")
+            # First try to get as album
+            try:
+                album_dict = self.spotify_api.get_album_info(actual_album_id_str, metadata)
+                if album_dict:
+                    parsed_album_info = self._parse_album_info(album_dict)
+                    if parsed_album_info:
+                        self.logger.info(f"Successfully parsed AlbumInfo for ID: {actual_album_id_str}, Name: {parsed_album_info.name}")
+                    else:
+                        self.logger.warning(f"Failed to parse AlbumInfo for ID: {actual_album_id_str} from dict: {album_dict}")
+                    return parsed_album_info
+                else:
+                    pass
+            except SpotifyItemNotFoundError:
+                # If album not found, try as show
+                self.logger.info(f"Album {actual_album_id_str} not found, trying as show...")
+                try:
+                    show_dict = self.spotify_api.get_show_info(actual_album_id_str, metadata)
+                    if show_dict:
+                        # Parse show as album-like object
+                        parsed_album_info = self._parse_album_info(show_dict)
+                        if parsed_album_info:
+                            self.logger.info(f"Successfully parsed show as AlbumInfo for ID: {actual_album_id_str}, Name: {parsed_album_info.name}")
+                        else:
+                            self.logger.warning(f"Failed to parse show as AlbumInfo for ID: {actual_album_id_str} from dict: {show_dict}")
+                        return parsed_album_info
+                    else:
+                        pass
+                except SpotifyItemNotFoundError:
+                    self.logger.warning(f"Neither album nor show found for ID {actual_album_id_str}")
+                    self.printer.oprint(f"[Warning] Album/Show {actual_album_id_str} not found.")
+                    return None
+                except Exception as show_error:
+                    self.logger.error(f"Error processing show {actual_album_id_str}: {show_error}")
+                    return None
+            except Exception as album_error:
+                # If album processing fails, try show as fallback
+                try:
+                    show_dict = self.spotify_api.get_show_info(actual_album_id_str, metadata)
+                    if show_dict:
+                        parsed_album_info = self._parse_album_info(show_dict)
+                        return parsed_album_info
+                    else:
+                        pass
+                except Exception as fallback_error:
+                    pass
+                self.logger.error(f"Both album and show processing failed for {actual_album_id_str}")
                 return None
 
-            parsed_album_info = self._parse_album_info(album_dict) # Use the helper method
-            if parsed_album_info:
-                self.logger.info(f"Successfully parsed AlbumInfo for ID: {actual_album_id_str}, Name: {parsed_album_info.name}")
-            else:
-                self.logger.warning(f"Failed to parse AlbumInfo for ID: {actual_album_id_str} from dict: {album_dict}")
-            return parsed_album_info
-
-        except SpotifyItemNotFoundError:
-            self.logger.warning(f"Album with ID {actual_album_id_str} not found.")
-            self.printer.oprint(f"[Warning] Album {actual_album_id_str} not found.")
-            print_exc()
         except SpotifyAuthError as sae:
             self.logger.error(f"Authentication error during Spotify get_album_info: {sae}")
             self.printer.oprint(f"[Error] Authentication error: {sae}")
@@ -720,11 +720,72 @@ class ModuleInterface:
         if not track_id or not quality_tier:
             self.logger.error("ModuleInterface.get_track_download: Missing track_id or quality_tier.")
             return None
+        
+        # Check if this is known to be an episode from download_extra_kwargs
+        is_episode = False
+        if track_info and hasattr(track_info, 'download_extra_kwargs'):
+            download_kwargs = track_info.download_extra_kwargs
+            if isinstance(download_kwargs, dict):
+                is_episode = download_kwargs.get('is_episode', False)
+        
         try:
             # Pass track_id and quality_tier along with other kwargs
             kwargs['track_id'] = track_id
             kwargs['quality_tier'] = quality_tier
-            return self.spotify_api.get_track_download(**kwargs)
+            
+            # If we know it's an episode, try episode download first
+            if is_episode:
+                self.logger.info(f"Detected episode from TrackInfo, using episode download for {track_id}")
+                try:
+                    return self.spotify_api.get_episode_download(**kwargs)
+                except Exception as episode_error:
+                    self.logger.warning(f"Episode download failed for {track_id}, trying as track: {episode_error}")
+                    # Fall through to try track download as fallback
+            
+            # First try as a regular track
+            try:
+                return self.spotify_api.get_track_download(**kwargs)
+            except SpotifyTrackUnavailableError as track_error:
+                # If track download fails, try as episode
+                self.logger.info(f"Track download failed for {track_id}, trying as episode: {track_error}")
+                try:
+                    return self.spotify_api.get_episode_download(**kwargs)
+                except Exception as episode_error:
+                    self.logger.warning(f"Episode download also failed for {track_id}: {episode_error}")
+                    # Re-raise the original track error since that was the first attempt
+                    raise track_error
+            except SpotifyApiError as api_error:
+                # Check if this is a 404 error from Extended Metadata (likely an episode)
+                error_str = str(api_error).lower()
+                error_repr = repr(api_error).lower()
+                # Check for various 404 error patterns - check both str() and repr() to catch all cases
+                is_404_error = (
+                    "status code 404" in error_str or 
+                    "extended metadata request failed" in error_str or
+                    "status code 404" in error_repr or
+                    "extended metadata request failed" in error_repr or
+                    ("404" in error_str and ("metadata" in error_str or "extended" in error_str))
+                )
+                
+                if is_404_error:
+                    self.logger.info(f"Track download returned 404 for {track_id}, trying as episode. Original error: {api_error}")
+                    self.logger.debug(f"Error string: {error_str}, Error repr: {error_repr}")
+                    try:
+                        episode_result = self.spotify_api.get_episode_download(**kwargs)
+                        self.logger.info(f"Successfully downloaded as episode for {track_id}")
+                        return episode_result
+                    except Exception as episode_error:
+                        self.logger.warning(f"Episode download also failed for {track_id}: {episode_error}")
+                        # Re-raise the original API error
+                        raise api_error
+                else:
+                    # For other API errors, don't try episode download
+                    self.logger.debug(f"SpotifyApiError for {track_id} is not a 404, not trying episode fallback. Error: {api_error}")
+                    raise api_error
+            except Exception as other_error:
+                # For other errors (like auth errors), don't try episode download
+                raise other_error
+                
         except SpotifyRateLimitDetectedError as e:
             # Don't print the full technical error message to the user - it will be handled by music_downloader.py
             # self.printer.oprint(f"Spotify rate limit detected during track download: {e}", drop_level=0)
@@ -732,7 +793,7 @@ class ModuleInterface:
             # Re-raise to be caught by music_downloader.py for deferral
             raise
         except SpotifyTrackUnavailableError as e:
-            self.printer.oprint(f"Track is unavailable on Spotify: {e}", drop_level=0)
+            self.printer.oprint(f"Track/Episode is unavailable on Spotify: {e}", drop_level=0)
             self.logger.warning(f"SpotifyTrackUnavailableError in get_track_download: {e}")
             return None # Or re-raise if music_downloader should handle it differently
         except SpotifyAuthError as e:
@@ -788,15 +849,44 @@ class ModuleInterface:
                     self.logger.warning(f"Skipping item '{item_name}' (type: {track_type}) at index {i} in playlist {playlist_id} as it's not a standard track object or is missing.")
                     continue
 
+                # Check if this is an episode instead of a track
+                item_type = actual_track_data.get('type', 'track')
                 track_info = None
+                
                 try:
-                    # _parse_track_info expects a dictionary of track data.                    
-                    track_info = self._parse_track_info(actual_track_data, index=i)
-                    if not track_info:
-                         self.logger.warning(f"_parse_track_info returned None for track data: {actual_track_data.get('name', 'N/A')}")
+                    if item_type == 'episode':
+                        # Handle episode: get episode info using get_episode_info
+                        episode_id = actual_track_data.get('id')
+                        if not episode_id:
+                            self.logger.warning(f"Episode at index {i} in playlist {playlist_id} has no ID. Skipping.")
+                            continue
+                        
+                        # Get codec options and quality tier for episode info
+                        if self.controller and hasattr(self.controller, 'settings'):
+                            codec_opts = self.controller.settings.get_codec_options(self.name)
+                        else:
+                            codec_opts = None
+                        
+                        self.logger.info(f"Processing episode '{actual_track_data.get('name', 'N/A')}' (ID: {episode_id}) in playlist {playlist_id}")
+                        track_info = self.get_track_info(episode_id, quality_tier=QualityEnum.HIGH, codec_options=codec_opts)
+                        if not track_info:
+                            self.logger.warning(f"get_track_info (episode fallback) returned None for episode ID: {episode_id}")
+                        elif track_info:
+                            # Mark this TrackInfo as an episode so we know to use episode download
+                            download_kwargs = getattr(track_info, 'download_extra_kwargs', {})
+                            if not isinstance(download_kwargs, dict):
+                                download_kwargs = {}
+                            download_kwargs['is_episode'] = True
+                            setattr(track_info, 'download_extra_kwargs', download_kwargs)
+                    else:
+                        # Handle regular track: use _parse_track_info
+                        track_info = self._parse_track_info(actual_track_data, index=i)
+                        if not track_info:
+                            self.logger.warning(f"_parse_track_info returned None for track data: {actual_track_data.get('name', 'N/A')}")
 
                 except Exception as e_parse:
-                    self.logger.error(f"Error parsing actual track data for '{actual_track_data.get('name', 'N/A')}' in playlist {playlist_id}: {e_parse}", exc_info=True)
+                    item_name = actual_track_data.get('name', 'N/A')
+                    self.logger.error(f"Error parsing {'episode' if item_type == 'episode' else 'track'} data for '{item_name}' in playlist {playlist_id}: {e_parse}", exc_info=True)
 
                 if track_info:
                     tracks.append(track_info)
@@ -958,65 +1048,80 @@ class ModuleInterface:
     def _parse_track_from_search(self, item_dict: dict) -> Optional[TrackInfo]:        
         pass
 
-    def _parse_album_info(self, raw_album_data: dict) -> Optional[AlbumInfo]:
-        album_id_for_logs = raw_album_data.get('id', 'UNKNOWN_ALBUM_ID_IN_PARSE')
-        self.logger.debug(f"Parsing album data for: {raw_album_data.get('name', 'N/A')} (ID: {album_id_for_logs})")
+    def _parse_album_info(self, album_dict: dict) -> Optional[AlbumInfo]:
+        """Parse album dictionary into AlbumInfo object. Now supports show data too."""
+        if not album_dict:
+            return None
+
+        album_id_for_logs = album_dict.get('id', 'UNKNOWN_ALBUM_ID_IN_PARSE')
+        self.logger.debug(f"Parsing album data for: {album_dict.get('name', 'N/A')} (ID: {album_id_for_logs})")
         try:
-            album_name = raw_album_data.get('name', "Unknown Album")
-            album_id = raw_album_data.get('id') # Keep the album's own ID
-            album_type = raw_album_data.get('album_type', 'album')
-            total_tracks_api = raw_album_data.get('total_tracks', 0) # From API, might differ from parsed tracks
+            album_name = album_dict.get('name', "Unknown Album")
+            album_id = album_dict.get('id') # Keep the album's own ID
+            album_type = album_dict.get('album_type', 'album')
+            total_tracks_api = album_dict.get('total_tracks', 0) # From API, might differ from parsed tracks
             is_explicit_album = False # Defaulting, as we only have track IDs initially from album_data['tracks']
 
             primary_artist_name = "Unknown Artist"
             album_artist_ids = [] # For multiple album artists if needed later
-            if raw_album_data.get('artists') and isinstance(raw_album_data['artists'], list) and len(raw_album_data['artists']) > 0:
-                primary_artist_name = raw_album_data['artists'][0].get('name', "Unknown Artist")
-                for art_data in raw_album_data['artists']:
+            if album_dict.get('artists') and isinstance(album_dict['artists'], list) and len(album_dict['artists']) > 0:
+                primary_artist_name = album_dict['artists'][0].get('name', "Unknown Artist")
+                for art_data in album_dict['artists']:
                     if isinstance(art_data, dict) and art_data.get('id'):
                         album_artist_ids.append(art_data.get('id'))
             
+            # Handle show data that doesn't have artists field
+            if 'publisher' in album_dict and not album_dict.get('artists'):
+                primary_artist_name = album_dict.get('publisher', 'Unknown Publisher')
+            
             release_year = 0
-            release_date_str = raw_album_data.get('release_date')
+            release_date_str = album_dict.get('release_date')
             if release_date_str and isinstance(release_date_str, str) and len(release_date_str) >= 4:
                 try: release_year = int(release_date_str[:4])
                 except ValueError: self.logger.warning(f"Could not parse year from album release_date: {release_date_str}")
 
             cover_url = None
-            if raw_album_data.get('images') and isinstance(raw_album_data['images'], list) and len(raw_album_data['images']) > 0:
-                cover_url = raw_album_data['images'][0].get('url')
+            if album_dict.get('images') and isinstance(album_dict['images'], list) and len(album_dict['images']) > 0:
+                cover_url = album_dict['images'][0].get('url')
 
             parsed_tracks: List[TrackInfo] = []
-            # Correctly get the list of track IDs from raw_album_data['tracks']
-            track_ids_from_album_data = raw_album_data.get('tracks', [])
+            # Correctly get the list of track IDs from album_data['tracks']
+            track_ids_from_album_data = album_dict.get('tracks', [])
+            
             if not isinstance(track_ids_from_album_data, list):
-                self.logger.warning(f"Expected raw_album_data['tracks'] to be a list of IDs for album {album_name}, but got {type(track_ids_from_album_data)}. Setting to empty list.")
-                track_ids_from_album_data = []
+                self.logger.warning(f"Expected album_data['tracks'] to be a list of IDs for album {album_name}, but got {type(track_ids_from_album_data)}. Setting to empty list.")
+                
+                # Try to extract track IDs if it's a dict with 'items'
+                if isinstance(track_ids_from_album_data, dict) and 'items' in track_ids_from_album_data:
+                    track_ids_from_album_data = [item.get('id') for item in track_ids_from_album_data.get('items', []) if item and item.get('id')]
+                else:
+                    track_ids_from_album_data = []
             
             self.logger.debug(f"Album '{album_name}' has {len(track_ids_from_album_data)} track IDs from API response.")
-
+            
             if self.controller and hasattr(self.controller, 'settings'): # Check if controller and settings exist
                 codec_opts = self.controller.settings.get_codec_options(self.name) # type: ignore
                 if self.debug_mode:
                     self.logger.debug(f"_parse_album_info: Codec options for {self.name}: {codec_opts}")
             else:
+                codec_opts = None  # Set to None if not available
                 if self.debug_mode:
                     self.logger.warning("_parse_album_info: Module controller or settings not available, cannot get codec options. Defaulting to None.")
 
-            for i, track_id_simple in enumerate(track_ids_from_album_data):
-                if not isinstance(track_id_simple, str):
-                    self.logger.warning(f"Skipping non-string track ID at index {i} in album {album_name}: {track_id_simple}")
-                    continue
+            for track_id in track_ids_from_album_data:
+                if not track_id:
+                    continue  # Skip empty or None track IDs
                 
-                if track_id_simple:
-                    self.logger.debug(f"Fetching full TrackInfo for track ID {track_id_simple} from album {album_name} (index {i})")
-                    full_track_info = self.get_track_info(track_id=track_id_simple, quality_tier=QualityEnum.HIGH)
-                    if full_track_info:
-                        parsed_tracks.append(full_track_info)
+                try:
+                    track_info = self.get_track_info(track_id, quality_tier=QualityEnum.HIGH, codec_options=codec_opts)
+                    
+                    if track_info:
+                        parsed_tracks.append(track_info)
                     else:
-                        self.logger.warning(f"Failed to get full TrackInfo for track ID {track_id_simple} from album {album_name}")
-                else:
-                    self.logger.warning(f"Skipping empty track ID in album {album_name} at index {i}.")
+                        self.logger.warning(f"Failed to get track info for track ID {track_id} in album {album_name}")
+                except Exception as track_error:
+                    self.logger.error(f"Error getting track info for track ID {track_id} in album {album_name}: {track_error}")
+                    # Continue processing other tracks even if one fails
             
             if parsed_tracks: # After fetching all tracks, determine if album is explicit
                 is_explicit_album = any(track.explicit for track in parsed_tracks if hasattr(track, 'explicit'))
@@ -1024,20 +1129,21 @@ class ModuleInterface:
 
             self.logger.info(f"Successfully parsed {len(parsed_tracks)} full TrackInfo objects for album '{album_name}'. API reported {total_tracks_api} tracks initially.")
 
-            # Construct AlbumInfo object            
-            album_info = AlbumInfo(
+            total_duration_s = sum(track.duration for track in parsed_tracks if track.duration) if parsed_tracks else 0
+            self.logger.info(f"Album parsing successful for: {album_name} (ID: {album_id}), Artist: {primary_artist_name}, Release Year: {release_year}, Tracks: {len(parsed_tracks)}")
+            
+            return AlbumInfo(
                 name=album_name,
-                artist=primary_artist_name, # Primary artist string
-                artist_id=album_artist_ids[0] if album_artist_ids else None, # Add primary artist_id
-                tracks=parsed_tracks,        # List of TrackInfo objects
+                artist=primary_artist_name,
+                artist_id=album_artist_ids[0] if album_artist_ids else None,
+                tracks=parsed_tracks,
+                all_track_cover_jpg_url=cover_url,
                 release_year=release_year,
-                cover_url=cover_url,
-                id=album_id,                 # Album's own Spotify ID
-                explicit=is_explicit_album
-                # Other fields like `album_artist_ids` can be added if AlbumInfo model supports them
+                explicit=is_explicit_album,
+                duration=total_duration_s,
+                track_extra_kwargs=codec_opts if codec_opts is not None else {},
+                id=album_id
             )
-            self.logger.info(f"Successfully created AlbumInfo object for '{album_name}' (ID: {album_id})")
-            return album_info
-        except Exception as e:
-            self.logger.error(f"Error parsing album data for ID {album_id_for_logs}: {e}", exc_info=True)
+        except Exception as parse_error:
+            self.logger.error(f"Failed to parse album data for ID {album_id_for_logs}: {parse_error}")
             return None

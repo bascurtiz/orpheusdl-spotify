@@ -31,7 +31,7 @@ import hashlib
 from librespot.core import Session as LibrespotSession
 from librespot.proto import Authentication_pb2
 import librespot.core
-from librespot.metadata import TrackId
+from librespot.metadata import TrackId, EpisodeId
 from librespot.audio.decoders import AudioQuality as LibrespotAudioQualityEnum, VorbisOnlyAudioQuality
 from librespot.core import TokenProvider as LibrespotTokenProvider 
 from librespot.mercury import MercuryClient
@@ -82,31 +82,17 @@ AUTH_URL = "https://accounts.spotify.com/"
 REDIRECT_URI = "http://127.0.0.1:4381/login"
 CLIENT_ID = "65b708073fc0480ea92a077233ca87bd"
 OAUTH_SCOPES = [
-    "app-remote-control",
-    "playlist-modify",
-    "playlist-modify-private",
-    "playlist-modify-public",
+    "streaming",
+    "user-read-email",
+    "user-read-private",
     "playlist-read",
     "playlist-read-collaborative",
     "playlist-read-private",
-    "streaming",
-    "ugc-image-upload",
-    "user-follow-modify",
-    "user-follow-read",
-    "user-library-modify",
     "user-library-read",
-    "user-modify",
-    "user-modify-playback-state",
-    "user-modify-private",
-    "user-personalized",
-    "user-read-birthdate",
-    "user-read-currently-playing",
-    "user-read-email",
-    "user-read-play-history",
-    "user-read-playback-position",
     "user-read-playback-state",
-    "user-read-private",
+    "user-read-currently-playing",
     "user-read-recently-played",
+    "user-read-playback-position",
     "user-top-read"
 ]
 DEFAULT_REQUEST_TIMEOUT = 15 # seconds
@@ -160,8 +146,9 @@ class OAuthCallbackHandler(BaseHTTPRequestHandler):
 
 class OAuth:
     """Handles the PKCE OAuth flow for Spotify."""
-    def __init__(self, client_id: str, redirect_uri: str, scopes: List[str], logger_instance=None):
+    def __init__(self, client_id: str, redirect_uri: str, scopes: List[str], logger_instance=None, client_secret: Optional[str] = None):
         self.client_id = client_id
+        self.client_secret = client_secret  # Optional: needed for token refresh with custom client_id
         self.redirect_uri = redirect_uri
         self.scopes_list = scopes
         self.logger = logger_instance if logger_instance else logging.getLogger(__name__ + ".OAuth")
@@ -244,6 +231,9 @@ class OAuth:
             'refresh_token': refresh_token_str,
             'client_id': self.client_id,
         }
+        # Add client_secret if available (needed for custom client_id token refresh)
+        if self.client_secret:
+            payload['client_secret'] = self.client_secret
         try:
             response = requests.post(AUTH_URL + "api/token", data=payload, timeout=DEFAULT_REQUEST_TIMEOUT)
             response.raise_for_status()
@@ -515,8 +505,41 @@ class SpotifyAPI:
         self.config = config if config else {}
         self.module_controller = module_controller
         self.librespot_session: Optional[LibrespotSession] = None        
-        self.user_market: Optional[str] = None        
-        self.oauth_handler: Optional[OAuth] = OAuth(CLIENT_ID, REDIRECT_URI, OAUTH_SCOPES, self.logger)
+        self.user_market: Optional[str] = None
+        
+        # Check if custom client_id and client_secret are provided in config
+        # This allows users to use their own Spotify Developer credentials to avoid rate limits
+        custom_client_id = self.config.get("client_id")
+        custom_client_secret = self.config.get("client_secret")
+        
+        # HYBRID APPROACH: Use custom credentials for Web API, Desktop client_id for librespot
+        # Web API OAuth handler (for metadata calls - uses custom credentials to avoid rate limits)
+        if custom_client_id and custom_client_secret:
+            self.logger.info(f"Using custom Spotify Client ID for Web API: {custom_client_id[:10]}... (from config)")
+            web_api_oauth_client_id = custom_client_id
+            web_api_oauth_client_secret = custom_client_secret
+        else:
+            self.logger.info("Using default Desktop Client ID for Web API (may be rate-limited by Spotify)")
+            web_api_oauth_client_id = CLIENT_ID
+            web_api_oauth_client_secret = None
+        
+        # Librespot OAuth handler (for audio streaming - always uses Desktop client_id for private tokens)
+        self.logger.info("Using Desktop Client ID for librespot audio streaming (requires private tokens)")
+        librespot_oauth_client_id = CLIENT_ID
+        librespot_oauth_client_secret = None
+        
+        # Create separate OAuth handlers
+        self.web_api_oauth_handler: Optional[OAuth] = OAuth(web_api_oauth_client_id, REDIRECT_URI, OAUTH_SCOPES, self.logger, client_secret=web_api_oauth_client_secret)
+        self.librespot_oauth_handler: Optional[OAuth] = OAuth(librespot_oauth_client_id, REDIRECT_URI, OAUTH_SCOPES, self.logger, client_secret=librespot_oauth_client_secret)
+        
+        # For backward compatibility, keep oauth_handler pointing to web_api_oauth_handler
+        self.oauth_handler: Optional[OAuth] = self.web_api_oauth_handler
+        
+        # Separate tokens for Web API and librespot
+        self.web_api_stored_token: Optional[StoredToken] = None
+        self.librespot_stored_token: Optional[StoredToken] = None
+        
+        # For backward compatibility, stored_token points to librespot token (used by librespot)
         self.stored_token: Optional[StoredToken] = None
         self.last_custom_provider_id_created: Optional[int] = None # ADDED FOR DIAGNOSTICS
 
@@ -575,6 +598,8 @@ class SpotifyAPI:
         # Save the full token details (including refresh token) for *our* use (e.g. refreshing)        
         full_token_details_for_storage = token_obj.to_dict()
         full_token_details_for_storage['spotify_username'] = username # Store the username we got/used
+        # Store the client_id used for this token so we can detect if it changed
+        full_token_details_for_storage['client_id'] = self.oauth_handler.client_id if self.oauth_handler else None
 
         try:
             # First, save the full token details (this is the primary credentials file now)
@@ -597,6 +622,31 @@ class SpotifyAPI:
             with open(self.credentials_file_path, 'r') as f:
                 token_data_from_file = json.load(f)
             
+            # Check if client_id has changed - if so, we need to re-authenticate with new credentials
+            stored_client_id = token_data_from_file.get('client_id')
+            current_client_id = self.oauth_handler.client_id if self.oauth_handler else None
+            
+            # If no client_id is stored, it's from the old Desktop client_id (before we added this feature)
+            # If we now have a custom client_id, we need to re-authenticate
+            if not stored_client_id and current_client_id and current_client_id != CLIENT_ID:
+                self.logger.warning(f"Old credentials file (no client_id stored) detected, but custom client_id is now configured. Removing old credentials to force re-authentication with new client ID.")
+                try:
+                    os.remove(self.credentials_file_path)
+                    self.logger.info(f"Removed credentials file {self.credentials_file_path} due to client_id change.")
+                except OSError as e:
+                    self.logger.error(f"Error removing credentials file: {e}")
+                return False
+            
+            # If client_id is stored and different from current, remove old credentials
+            if stored_client_id and current_client_id and stored_client_id != current_client_id:
+                self.logger.warning(f"Client ID has changed (stored: {stored_client_id[:10]}..., current: {current_client_id[:10]}...). Removing old credentials to force re-authentication with new client ID.")
+                try:
+                    os.remove(self.credentials_file_path)
+                    self.logger.info(f"Removed credentials file {self.credentials_file_path} due to client_id change.")
+                except OSError as e:
+                    self.logger.error(f"Error removing credentials file: {e}")
+                return False
+            
             # Check for essential fields from StoredToken.to_dict()
             if not all(k in token_data_from_file for k in ["access_token", "refresh_token", "expires_in"]):
                 self.logger.warning(f"Credentials file {self.credentials_file_path} is missing essential token fields. Re-authentication needed.")
@@ -608,18 +658,37 @@ class SpotifyAPI:
                 self.logger.info("Existing token is expired. Attempting to refresh...")
                 if not loaded_token.refresh_token:
                     self.logger.warning("No refresh token available. Full re-authentication required.")
+                    try:
+                        os.remove(self.credentials_file_path)
+                        self.logger.info(f"Removed credentials file {self.credentials_file_path} (no refresh token).")
+                    except OSError as e_rm:
+                        self.logger.error(f"Error removing credentials file: {e_rm}")
                     return False
                 
                 refreshed_token_data = self.oauth_handler.refresh_access_token(loaded_token.refresh_token)
                 if refreshed_token_data:
-                    self.stored_token = StoredToken(refreshed_token_data)                    
+                    self.stored_token = StoredToken(refreshed_token_data)
+                    # Save the refreshed token
+                    try:
+                        token_dict = self.stored_token.to_dict()
+                        token_dict['spotify_username'] = token_data_from_file.get('spotify_username', 'PKCE_USER')
+                        token_dict['client_id'] = self.oauth_handler.client_id if self.oauth_handler else None
+                        with open(self.credentials_file_path, 'w') as f:
+                            json.dump(token_dict, f, indent=4)
+                        self.logger.info("Successfully refreshed and saved token.")
+                    except Exception as e_save:
+                        self.logger.warning(f"Could not save refreshed token: {e_save}")
                     self.logger.info("Successfully refreshed and loaded token.")
                     return True # Librespot session will be created next
                 else:
-                    self.logger.warning("Failed to refresh token. Full re-authentication required.")
-                    # Potentially delete the invalid credentials file here
-                    try: os.remove(self.credentials_file_path); self.logger.info(f"Removed invalid/expired credentials file: {self.credentials_file_path}")
-                    except OSError as e_rm: self.logger.error(f"Error removing invalid credentials file: {e_rm}")
+                    error_msg = self.oauth_handler.error_message if self.oauth_handler else "Unknown error"
+                    self.logger.warning(f"Failed to refresh token: {error_msg}. Full re-authentication required.")
+                    # Delete the invalid credentials file to force re-authentication
+                    try:
+                        os.remove(self.credentials_file_path)
+                        self.logger.info(f"Removed invalid/expired credentials file: {self.credentials_file_path}")
+                    except OSError as e_rm:
+                        self.logger.error(f"Error removing invalid credentials file: {e_rm}")
                     return False
             else:
                 self.stored_token = loaded_token
@@ -633,8 +702,8 @@ class SpotifyAPI:
             self.logger.error(f"Unexpected error loading credentials: {e}", exc_info=True)
             return False
 
-    def _perform_oauth_flow(self) -> bool:
-        """Performs the full PKCE OAuth flow and saves credentials."""
+    def _perform_oauth_flow(self, save_to_main_file: bool = True) -> bool:
+        """Performs the full PKCE OAuth flow and optionally saves credentials to the main file."""
         if not self.oauth_handler:
             self.logger.error("OAuth handler not initialized!")
             return False
@@ -655,7 +724,10 @@ class SpotifyAPI:
             else:
                 self.logger.warning("Could not determine user market from OAuth flow.")
 
-            self._save_credentials(self.stored_token, username_for_storage)
+            if save_to_main_file:
+                self._save_credentials(self.stored_token, username_for_storage)
+            else:
+                self.logger.info("Skipping save to main credentials file (save_to_main_file=False).")
             return True
         else:
             self.logger.error(f"OAuth flow failed. Error: {self.oauth_handler.error_message if self.oauth_handler else 'Unknown OAuth error'}")
@@ -797,38 +869,222 @@ class SpotifyAPI:
         
         return False
 
+    def _get_web_api_token(self) -> Optional[str]:
+        """Get access token for Web API calls. Uses custom OAuth token if available, otherwise falls back to librespot token.
+        Automatically refreshes expired tokens if refresh_token is available."""
+        # Prefer web_api_stored_token (custom credentials) for Web API calls
+        if self.web_api_stored_token and self.web_api_stored_token.access_token:
+            if self.web_api_stored_token.expired():
+                # Token expired, try to refresh if refresh_token is available
+                if self.web_api_stored_token.refresh_token and self.web_api_oauth_handler:
+                    self.logger.info("Web API token expired, attempting to refresh automatically...")
+                    try:
+                        refreshed_token_data = self.web_api_oauth_handler.refresh_access_token(self.web_api_stored_token.refresh_token)
+                        if refreshed_token_data:
+                            self.web_api_stored_token = StoredToken(refreshed_token_data)
+                            # Save the refreshed token
+                            web_api_credentials_path = self.credentials_file_path.replace('.json', '_webapi.json')
+                            try:
+                                token_dict = self.web_api_stored_token.to_dict()
+                                token_dict['client_id'] = self.web_api_oauth_handler.client_id
+                                with open(web_api_credentials_path, 'w') as f:
+                                    json.dump(token_dict, f, indent=4)
+                                self.logger.info(f"Auto-refreshed and saved Web API credentials to {web_api_credentials_path}")
+                            except Exception as e_save:
+                                self.logger.warning(f"Could not save auto-refreshed Web API credentials: {e_save}")
+                            return self.web_api_stored_token.access_token
+                        else:
+                            self.logger.warning("Failed to auto-refresh Web API token. Will need re-authentication.")
+                    except Exception as refresh_err:
+                        self.logger.warning(f"Error auto-refreshing Web API token: {refresh_err}")
+                else:
+                    self.logger.warning("Web API token expired and no refresh_token available. Re-authentication required.")
+            else:
+                return self.web_api_stored_token.access_token
+        
+        # Fallback to librespot token if web_api token not available
+        if self.librespot_stored_token and self.librespot_stored_token.access_token and not self.librespot_stored_token.expired():
+            return self.librespot_stored_token.access_token
+        # Last resort: use stored_token (backward compatibility)
+        if self.stored_token and self.stored_token.access_token and not self.stored_token.expired():
+            return self.stored_token.access_token
+        return None
+
+    def _clear_credentials(self):
+        """Clear all Spotify credentials files to force re-authentication."""
+        credentials_files = [
+            self.credentials_file_path,
+            self.credentials_file_path.replace('.json', '_webapi.json')
+        ]
+        for cred_file in credentials_files:
+            if os.path.exists(cred_file):
+                try:
+                    os.remove(cred_file)
+                    self.logger.info(f"Removed credentials file: {cred_file}")
+                except OSError as e:
+                    self.logger.warning(f"Could not remove credentials file {cred_file}: {e}")
+
     def _load_credentials_and_init_session(self) -> bool:
-        """Loads existing OAuth credentials or performs PKCE flow, then creates librespot session."""
+        """Loads existing OAuth credentials or performs PKCE flow, then creates librespot session.
+        Uses hybrid approach: librespot always uses Desktop client_id, Web API uses custom credentials if available."""
         self.logger.info("Attempting to authenticate and initialize session...")
         
-        # 1. Try to load existing credentials (StoredToken with access/refresh tokens)
+        # Step 1: Load/initialize librespot token (always uses Desktop client_id for private tokens)
+        # Temporarily switch to librespot handler
+        original_oauth_handler = self.oauth_handler
+        self.oauth_handler = self.librespot_oauth_handler
+        
+        librespot_loaded = False
+        credentials_existed = os.path.exists(self.credentials_file_path)
         if self._load_existing_credentials():
-            self.logger.info("Successfully loaded existing OAuth credentials.")
-            # Now, create librespot session using these loaded credentials
-            if self._create_librespot_session_from_oauth():
-                self.logger.info("Successfully initialized Librespot session from existing OAuth credentials.")
-                return True
-            else:
-                self.logger.warning("Failed to create Librespot session from existing OAuth credentials. Forcing new OAuth flow.")                
-                self.stored_token = None
-                try: os.remove(self.credentials_file_path); self.logger.info(f"Removed credentials file {self.credentials_file_path} to force re-auth.");
-                except OSError: pass # Ignore if already gone
+            self.logger.info("Successfully loaded existing librespot OAuth credentials.")
+            self.librespot_stored_token = self.stored_token
+            librespot_loaded = True
         else:
-            self.logger.info("No valid existing credentials found or refresh failed.")
-
-        # 2. If loading failed or was skipped, perform full OAuth flow
-        self.logger.info("Proceeding with full PKCE OAuth flow.")
-        if self._perform_oauth_flow():
-            self.logger.info("OAuth PKCE flow completed successfully.")
-            # Now, create librespot session using the NEWLY obtained OAuth credentials
-            if self._create_librespot_session_from_oauth():
-                self.logger.info("Successfully initialized Librespot session after new OAuth flow.")
-                return True
+            # If credentials file existed but loading failed, it means refresh failed
+            if credentials_existed:
+                self.logger.warning("Credentials file exists but could not be loaded (likely refresh failed). Clearing invalid credentials...")
+                self._clear_credentials()
+            self.logger.info("No valid existing librespot credentials found, will perform OAuth flow.")
+        
+        if not librespot_loaded:
+            self.logger.info("Proceeding with librespot PKCE OAuth flow (Desktop client_id).")
+            print("\n" + "="*60)
+            print("SPOTIFY AUTHENTICATION REQUIRED")
+            print("="*60)
+            print("A browser window will open for Spotify authorization.")
+            print("Please complete the authorization in your browser.")
+            print("="*60 + "\n")
+            
+            oauth_error = None
+            if self.oauth_handler and hasattr(self.oauth_handler, 'error_message') and self.oauth_handler.error_message:
+                oauth_error = self.oauth_handler.error_message
+            oauth_result = self._perform_oauth_flow()
+            if oauth_result:
+                self.librespot_stored_token = self.stored_token
+                self.logger.info("Librespot OAuth PKCE flow completed successfully.")
+                print("\n✓ Spotify authentication successful!\n")
             else:
-                self.logger.error("CRITICAL: Failed to create Librespot session even after a successful new OAuth flow.")                
+                error_msg = self.oauth_handler.error_message if (self.oauth_handler and hasattr(self.oauth_handler, 'error_message')) else "Unknown error"
+                self.logger.error(f"Librespot OAuth PKCE flow failed: {error_msg}")
+                print(f"\n✗ Spotify authentication failed: {error_msg}\n")
+                self.oauth_handler = original_oauth_handler
                 return False
+        
+        # Step 2: If custom credentials are available, also load/initialize Web API token
+        if self.web_api_oauth_handler != self.librespot_oauth_handler:
+            self.oauth_handler = self.web_api_oauth_handler
+            # Try to load Web API credentials from a separate file or perform OAuth flow
+            web_api_credentials_path = self.credentials_file_path.replace('.json', '_webapi.json')
+            
+            web_api_loaded = False
+            if os.path.exists(web_api_credentials_path):
+                self.logger.info(f"Web API credentials file found at {web_api_credentials_path}, attempting to load...")
+                try:
+                    with open(web_api_credentials_path, 'r') as f:
+                        token_data = json.load(f)
+                    
+                    # Check if client_id matches (similar to librespot credentials check)
+                    stored_client_id = token_data.get('client_id')
+                    current_client_id = self.oauth_handler.client_id if self.oauth_handler else None
+                    if stored_client_id and current_client_id and stored_client_id != current_client_id:
+                        self.logger.warning(f"Web API Client ID has changed (stored: {stored_client_id[:10]}..., current: {current_client_id[:10]}...). Removing old credentials.")
+                        try:
+                            os.remove(web_api_credentials_path)
+                            self.logger.info(f"Removed Web API credentials file {web_api_credentials_path} due to client_id change.")
+                        except OSError as e_rm:
+                            self.logger.error(f"Error removing Web API credentials file: {e_rm}")
+                    elif all(k in token_data for k in ["access_token", "refresh_token", "expires_in"]):
+                        loaded_token = StoredToken.from_dict(token_data)
+                        if loaded_token.expired():
+                            self.logger.info("Web API token is expired, attempting to refresh...")
+                            refreshed = self.oauth_handler.refresh_access_token(loaded_token.refresh_token)
+                            if refreshed:
+                                self.web_api_stored_token = StoredToken(refreshed)
+                                # Save the refreshed token
+                                try:
+                                    token_dict = self.web_api_stored_token.to_dict()
+                                    token_dict['client_id'] = self.oauth_handler.client_id
+                                    with open(web_api_credentials_path, 'w') as f:
+                                        json.dump(token_dict, f, indent=4)
+                                    self.logger.info(f"Saved refreshed Web API credentials to {web_api_credentials_path}")
+                                except Exception as e_save:
+                                    self.logger.warning(f"Could not save refreshed Web API credentials: {e_save}")
+                                web_api_loaded = True
+                                self.logger.info("Web API credentials successfully loaded and refreshed.")
+                            else:
+                                error_msg = self.oauth_handler.error_message if hasattr(self.oauth_handler, 'error_message') else "Unknown error"
+                                self.logger.warning(f"Failed to refresh Web API token: {error_msg}. Will perform new OAuth flow.")
+                        else:
+                            self.web_api_stored_token = loaded_token
+                            web_api_loaded = True
+                            self.logger.info("Web API credentials successfully loaded (token still valid).")
+                    else:
+                        self.logger.warning(f"Web API credentials file is missing required fields. Will perform new OAuth flow.")
+                except Exception as e:
+                    self.logger.warning(f"Could not load Web API credentials: {e}", exc_info=True)
+            else:
+                self.logger.info(f"Web API credentials file not found at {web_api_credentials_path}. Will perform new OAuth flow.")
+            
+            if not web_api_loaded:
+                self.logger.info("Proceeding with Web API PKCE OAuth flow (custom credentials).")
+                # Don't save to the main credentials.json file, we will save to credentials_webapi.json manually below
+                if self._perform_oauth_flow(save_to_main_file=False):
+                    self.web_api_stored_token = self.stored_token
+                    # Save Web API token to separate file
+                    try:
+                        with open(web_api_credentials_path, 'w') as f:
+                            token_dict = self.stored_token.to_dict()
+                            token_dict['client_id'] = self.oauth_handler.client_id
+                            json.dump(token_dict, f, indent=4)
+                        self.logger.info(f"Saved Web API credentials to {web_api_credentials_path}")
+                        # Verify file was created
+                        if os.path.exists(web_api_credentials_path):
+                            pass
+                        else:
+                            self.logger.warning("Web API credentials file NOT found after save!")
+                    except Exception as e:
+                        self.logger.warning(f"Could not save Web API credentials: {e}")
+                else:
+                    self.logger.warning("Web API OAuth PKCE flow failed, will use librespot token as fallback.")
+                    self.web_api_stored_token = self.librespot_stored_token
         else:
-            self.logger.error("OAuth PKCE flow failed.")
+            # Same handler, reuse librespot token
+            self.web_api_stored_token = self.librespot_stored_token
+        
+        # Restore original handler and set stored_token to librespot token for backward compatibility
+        self.oauth_handler = original_oauth_handler
+        self.stored_token = self.librespot_stored_token
+        
+        # Step 3: Create librespot session using librespot token
+        if self._create_librespot_session_from_oauth():
+            self.logger.info("Successfully initialized Librespot session.")
+            return True
+        else:
+            self.logger.error("Failed to create Librespot session with loaded/refreshed credentials. Credentials might be invalid.")
+            # If session creation failed, force re-authentication
+            self.logger.info("Forcing re-authentication due to session creation failure...")
+            self._clear_credentials()
+            
+            # Switch back to librespot handler for the re-auth flow
+            self.oauth_handler = self.librespot_oauth_handler
+            
+            self.logger.info("Proceeding with librespot PKCE OAuth flow (Desktop client_id) - Retry.")
+            print("\n" + "="*60)
+            print("SPOTIFY AUTHENTICATION REQUIRED (Session Creation Failed)")
+            print("="*60)
+            print("A browser window will open for Spotify authorization.")
+            print("Please complete the authorization in your browser.")
+            print("="*60 + "\n")
+            
+            if self._perform_oauth_flow():
+                self.librespot_stored_token = self.stored_token
+                # Try creating session again
+                if self._create_librespot_session_from_oauth():
+                    self.logger.info("Successfully initialized Librespot session after re-authentication.")
+                    return True
+            
+            self.logger.error("CRITICAL: Failed to create Librespot session even after re-authentication attempt.")
             return False
 
     def _is_session_valid(self, session_obj: Optional[LibrespotSession]) -> bool:
@@ -868,19 +1124,20 @@ class SpotifyAPI:
            Returns the market string or None if fetching fails.
         """
         self.logger.debug(f"SpotifyAPI._fetch_user_market called{' (retry)' if _retry_attempted else ''}")
-        if not self.stored_token or not self.stored_token.access_token or self.stored_token.expired():
-            self.logger.info("SpotifyAPI._fetch_user_market: Token missing, invalid or expired. Attempting to load/refresh session.")
-            # Try to re-initialize the session to get a valid token
+        
+        # Get Web API token (uses custom credentials if available, otherwise librespot token)
+        web_api_token = self._get_web_api_token()
+        if not web_api_token:
+            self.logger.info("SpotifyAPI._fetch_user_market: Token missing. Attempting to load/refresh session.")
             if not self._load_credentials_and_init_session():
                 self.logger.warning("SpotifyAPI._fetch_user_market: Session initialization failed. Cannot fetch market.")
                 return None
-        
-        # After potential session init, check token again
-        if not self.stored_token or not self.stored_token.access_token:
-            self.logger.warning("SpotifyAPI._fetch_user_market: Still no valid access token after attempt. Cannot fetch market.")
-            return None
+            web_api_token = self._get_web_api_token()
+            if not web_api_token:
+                self.logger.warning("SpotifyAPI._fetch_user_market: Still no valid access token after attempt. Cannot fetch market.")
+                return None
 
-        headers = {'Authorization': f'Bearer {self.stored_token.access_token}'}
+        headers = {'Authorization': f'Bearer {web_api_token}'}
         web_api_me_url = "https://api.spotify.com/v1/me"
         try:
             response = requests.get(web_api_me_url, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT)
@@ -897,8 +1154,9 @@ class SpotifyAPI:
                 self.logger.warning(f"SpotifyAPI._fetch_user_market: Auth error (401). Token might be invalid.")
                 if not _retry_attempted:
                     self.logger.info("SpotifyAPI._fetch_user_market: Attempting re-auth and retry for 401.")
-                    self.stored_token = None
-                    if self._perform_oauth_flow():
+                    # Invalidate Web API token and re-initialize session
+                    self.web_api_stored_token = None
+                    if self._load_credentials_and_init_session():
                         self.logger.info("SpotifyAPI._fetch_user_market: Re-auth successful. Retrying call.")
                         return self._fetch_user_market(_retry_attempted=True)
                     else:
@@ -942,16 +1200,17 @@ class SpotifyAPI:
         if limit > SPOTIFY_MAX_LIMIT_PER_REQUEST:
             self.logger.info(f"SpotifyAPI.search: Requested limit {limit} exceeds Spotify's max of {SPOTIFY_MAX_LIMIT_PER_REQUEST}. Will use pagination to fetch all requested results.")
         
-        # Initial auth check
-        if not self.stored_token or not self.stored_token.access_token or self.stored_token.expired():
-            self.logger.info("SpotifyAPI.search: Token missing, invalid or expired. Attempting to load/refresh session.")
+        # Get Web API token (uses custom credentials if available, otherwise librespot token)
+        web_api_token = self._get_web_api_token()
+        if not web_api_token:
+            self.logger.info("SpotifyAPI.search: Token missing. Attempting to load/refresh session.")
             if not self._load_credentials_and_init_session():
                 self.logger.error("SpotifyAPI.search: Session initialization failed.")
                 raise SpotifyAuthError("Authentication required/failed for search. Session could not be initialized.")
-        
-        if not self.stored_token or not self.stored_token.access_token:
-            self.logger.error("SpotifyAPI.search: Still no access token after session initialization attempt.")
-            raise SpotifyAuthError("Authentication failed for search. No valid token.")
+            web_api_token = self._get_web_api_token()
+            if not web_api_token:
+                self.logger.error("SpotifyAPI.search: Still no access token after session initialization attempt.")
+                raise SpotifyAuthError("Authentication failed for search. No valid token.")
 
         # Determine market if not provided
         effective_market = market
@@ -963,7 +1222,7 @@ class SpotifyAPI:
         query_type_str = query_type_enum_or_str.name.lower() if hasattr(query_type_enum_or_str, 'name') else str(query_type_enum_or_str).lower()
         
         search_url = "https://api.spotify.com/v1/search"
-        headers = {'Authorization': f'Bearer {self.stored_token.access_token}'}
+        headers = {'Authorization': f'Bearer {web_api_token}'}
         
         # Collect all results across multiple requests if needed
         all_items = []
@@ -1030,8 +1289,9 @@ class SpotifyAPI:
                     self.logger.warning(f"SpotifyAPI.search: Auth error (401) for query '{query_str}'. Token might be invalid.")
                     if not _retry_attempted:
                         self.logger.info("SpotifyAPI.search: Attempting re-auth and retry for 401.")
-                        self.stored_token = None
-                        if self._perform_oauth_flow():
+                        # Invalidate Web API token and re-initialize session
+                        self.web_api_stored_token = None
+                        if self._load_credentials_and_init_session():
                             self.logger.info("SpotifyAPI.search: Re-auth successful. Retrying call.")
                             return self.search(query_type_enum_or_str, query_str, track_info, market, limit, _retry_attempted=True)
                         else:
@@ -1163,12 +1423,21 @@ class SpotifyAPI:
             
             content_feeder = self.librespot_session.content_feeder()
             self.logger.info(f"Attempting to load track {track_id_hex} using content_feeder.load_track with VorbisOnlyAudioQuality.")
-            stream_loader = content_feeder.load_track(
-                track_id_obj,
-                VorbisOnlyAudioQuality(librespot_audio_quality_mode),
-                False, 
-                None   
-            )
+            try:
+                stream_loader = content_feeder.load_track(
+                    track_id_obj,
+                    VorbisOnlyAudioQuality(librespot_audio_quality_mode),
+                    False, 
+                    None   
+                )
+            except Exception as load_err:
+                # Check if this is a 404 error (likely an episode)
+                error_str = str(load_err).lower()
+                if "status code 404" in error_str or "extended metadata request failed" in error_str:
+                    self.logger.info(f"Track load failed with 404 for {track_id_hex}, likely an episode. Re-raising as SpotifyApiError for episode fallback.")
+                    raise SpotifyApiError(f"Failed to download track {track_id_hex}: Extended Metadata request failed: Status code 404") from load_err
+                raise
+            
             if not stream_loader or not hasattr(stream_loader, 'input_stream') or not stream_loader.input_stream:
                 self.logger.error(f"Librespot returned no stream_loader or input_stream for track {track_id_hex} (TrackId: {str(track_id_obj)}).")
                 try:
@@ -1178,6 +1447,13 @@ class SpotifyAPI:
                          raise SpotifyTrackUnavailableError(f"No audio files listed for track GID {track_id_hex} and stream_loader failed.")
                     elif not track_metadata_check:
                          self.logger.error(f"Additionally, failed to get any track metadata from librespot for GID hex: {track_id_hex}")
+                except ConnectionError as conn_err:
+                    # Check if this is a 404 error (likely an episode)
+                    error_str = str(conn_err).lower()
+                    if "status code 404" in error_str or "extended metadata request failed" in error_str:
+                        self.logger.info(f"Track metadata check failed with 404 for {track_id_hex}, likely an episode. Re-raising as SpotifyApiError for episode fallback.")
+                        raise SpotifyApiError(f"Failed to download track {track_id_hex}: Extended Metadata request failed: Status code 404") from conn_err
+                    raise
                 except Exception as meta_err:
                      self.logger.error(f"Error during additional metadata check for {track_id_hex} after stream_loader failure: {meta_err}")
                 raise SpotifyTrackUnavailableError(f"Failed to load audio stream (no stream_loader or input_stream) for GID {track_id_hex}")
@@ -1223,7 +1499,10 @@ class SpotifyAPI:
                 self.logger.error(f"Unhandled RuntimeError during get_track_download for {track_id_hex}: {rt_err}", exc_info=True)
                 raise SpotifyApiError(f"Runtime error during track download {track_id_hex}: {rt_err}") from rt_err
         except Exception as e:
-            self.logger.error(f"Unexpected error during get_track_download for {track_id_hex}: {e}", exc_info=True)
+            error_str = str(e)
+            error_type = type(e).__name__
+            self.logger.error(f"Unexpected error during get_track_download for {track_id_hex}: {error_type}: {error_str}", exc_info=True)
+            
             if temp_file_path and os.path.exists(temp_file_path):
                 try:
                     os.unlink(temp_file_path)
@@ -1258,28 +1537,40 @@ class SpotifyAPI:
         """Alias for _load_credentials_and_init_session to maintain compatibility with interface.py."""
         self.logger.debug(f"authenticate_stream_api called (aliased to _load_credentials_and_init_session). is_initial_setup_check={is_initial_setup_check}")
         try:
-            return self._load_credentials_and_init_session()
+            result = self._load_credentials_and_init_session()
+            if not result:
+                # If authentication failed, check if OAuth flow was attempted
+                if self.oauth_handler and hasattr(self.oauth_handler, 'error_message') and self.oauth_handler.error_message:
+                    self.logger.error(f"Authentication failed: {self.oauth_handler.error_message}")
+                else:
+                    self.logger.error("Authentication failed: Unknown error during credential loading or OAuth flow")
+            return result
         except SpotifyApiError as e:
             self.logger.error(f"authenticate_stream_api failed: {e}")
             if isinstance(e, (SpotifyAuthError, SpotifyConfigError, SpotifyLibrespotError)):
                  return False 
-            raise 
+            raise
+        except Exception as e:
+            self.logger.error(f"Unexpected error in authenticate_stream_api: {e}", exc_info=True)
+            return False 
 
     def get_track_by_id(self, track_id: str, market: Optional[str] = None, _retry_attempted: bool = False) -> Optional[dict]:
         """Get track details by its Spotify ID using the Web API."""
         self.logger.debug(f"SpotifyAPI.get_track_by_id entered for track_id: {track_id}, market: {market}{', retry' if _retry_attempted else ''}")
 
-        if not self.stored_token or not self.stored_token.access_token or self.stored_token.expired():
-            self.logger.info("SpotifyAPI.get_track_by_id: Token missing, invalid or expired. Attempting to load/refresh session.")
+        # Get Web API token (uses custom credentials if available, otherwise librespot token)
+        web_api_token = self._get_web_api_token()
+        if not web_api_token:
+            self.logger.info("SpotifyAPI.get_track_by_id: Token missing. Attempting to load/refresh session.")
             if not self._load_credentials_and_init_session(): 
                 self.logger.error("SpotifyAPI.get_track_by_id: Session initialization failed.")
                 raise SpotifyAuthError("Authentication required/failed for get_track_by_id. Session could not be initialized.")
-        
-        if not self.stored_token or not self.stored_token.access_token: 
-             self.logger.error("SpotifyAPI.get_track_by_id: Still no access token after session initialization attempt.")
-             raise SpotifyAuthError("Authentication failed for get_track_by_id. No valid token.")
+            web_api_token = self._get_web_api_token()
+            if not web_api_token:
+                self.logger.error("SpotifyAPI.get_track_by_id: Still no access token after session initialization attempt.")
+                raise SpotifyAuthError("Authentication failed for get_track_by_id. No valid token.")
 
-        headers = {"Authorization": f"Bearer {self.stored_token.access_token}"}
+        headers = {"Authorization": f"Bearer {web_api_token}"}
         params = {}
         if market:
             params["market"] = market
@@ -1299,8 +1590,9 @@ class SpotifyAPI:
                 self.logger.warning(f"SpotifyAPI.get_track_by_id: Auth error (401) for track {track_id}. Token might be invalid.")
                 if not _retry_attempted:
                     self.logger.info("SpotifyAPI.get_track_by_id: Attempting re-auth and retry for 401.")
-                    self.stored_token = None # Invalidate current token
-                    if self._perform_oauth_flow():
+                    # Invalidate Web API token
+                    self.web_api_stored_token = None
+                    if self._load_credentials_and_init_session():
                         self.logger.info("SpotifyAPI.get_track_by_id: Re-auth successful. Retrying call.")
                         return self.get_track_by_id(track_id, market, _retry_attempted=True)
                     else:
@@ -1416,11 +1708,17 @@ class SpotifyAPI:
         and then enriches it with stream details if necessary (placeholder for now).
         """
         self.logger.debug(f"SpotifyAPI.get_track_info entered for track_id: {track_id}")
-        if not self.stored_token or not self.stored_token.access_token or self.stored_token.expired():
-            self.logger.info("Access token missing or expired in get_track_info. Attempting to load/refresh.")
+        # Get Web API token (uses custom credentials if available, otherwise librespot token)
+        web_api_token = self._get_web_api_token()
+        if not web_api_token:
+            self.logger.info("Access token missing in get_track_info. Attempting to load/refresh.")
             if not self._load_credentials_and_init_session():
                 self.logger.error("Failed to ensure authentication for get_track_info.")
-                pass 
+                return None
+            web_api_token = self._get_web_api_token()
+            if not web_api_token:
+                self.logger.error("Still no access token after session initialization in get_track_info.")
+                return None 
         try:
             web_api_track_data = self.get_track_by_id(track_id) 
             if not web_api_track_data:
@@ -1497,20 +1795,20 @@ class SpotifyAPI:
     def get_album_info(self, album_id: str, metadata: Optional['AlbumInfo'] = None, _retry_attempted: bool = False) -> Optional[dict]:
         self.logger.info(f"SpotifyAPI: Attempting to get album info for ID: {album_id}{' (retry)' if _retry_attempted else ''}")
 
-        # Initial check for token validity before making the API call
-        if not self.stored_token or not self.stored_token.access_token or self.stored_token.expired():
-            self.logger.info("SpotifyAPI.get_album_info: Token missing, invalid or expired. Attempting to load/refresh session.")
+        # Get Web API token (uses custom credentials if available, otherwise librespot token)
+        web_api_token = self._get_web_api_token()
+        if not web_api_token:
+            self.logger.info("SpotifyAPI.get_album_info: Token missing. Attempting to load/refresh session.")
             if not self._load_credentials_and_init_session():
                 self.logger.error("SpotifyAPI.get_album_info: Session initialization failed.")
                 raise SpotifyAuthError("Authentication required/failed for get_album_info. Session could not be initialized.")
-        
-        # Ensure token is definitely valid after potential refresh/load
-        if not self.stored_token or not self.stored_token.access_token:
-            self.logger.error("SpotifyAPI.get_album_info: Still no access token after session initialization attempt.")
-            raise SpotifyAuthError("Authentication failed for get_album_info. No valid token.")
+            web_api_token = self._get_web_api_token()
+            if not web_api_token:
+                self.logger.error("SpotifyAPI.get_album_info: Still no access token after session initialization attempt.")
+                raise SpotifyAuthError("Authentication failed for get_album_info. No valid token.")
 
         api_url = f"https://api.spotify.com/v1/albums/{album_id}"
-        headers = {"Authorization": f"Bearer {self.stored_token.access_token}"}
+        headers = {"Authorization": f"Bearer {web_api_token}"}
         params = {}
         if self.user_market:
             params['market'] = self.user_market
@@ -1528,8 +1826,8 @@ class SpotifyAPI:
                     next_tracks_url = album_data['tracks'].get('next')
                     while next_tracks_url:
                         self.logger.debug(f"SpotifyAPI.get_album_info: Fetching next page of tracks from {next_tracks_url}")
-                        # Use new access token for paginated calls if it was refreshed
-                        current_headers = {"Authorization": f"Bearer {self.stored_token.access_token}"}
+                        # Use Web API token for paginated calls (same as initial request)
+                        current_headers = {"Authorization": f"Bearer {web_api_token}"}
                         paginated_response = requests.get(next_tracks_url, headers=current_headers, timeout=DEFAULT_REQUEST_TIMEOUT)
                         if paginated_response.status_code == 200:
                             paginated_data = paginated_response.json()
@@ -1537,8 +1835,9 @@ class SpotifyAPI:
                             next_tracks_url = paginated_data.get('next')
                         elif paginated_response.status_code == 401 and not _retry_attempted:
                             self.logger.warning(f"SpotifyAPI.get_album_info (pagination): Auth error (401) fetching next page for {album_id}. Invalidating token and attempting full re-auth flow.")
-                            self.stored_token = None # Invalidate token
-                            if self._perform_oauth_flow(): # This will open browser if needed
+                            # Invalidate Web API token and re-initialize session
+                            self.web_api_stored_token = None
+                            if self._load_credentials_and_init_session():
                                 self.logger.info("SpotifyAPI.get_album_info (pagination): Re-authentication successful. Retrying the original get_album_info call.")
                                 return self.get_album_info(album_id, metadata, _retry_attempted=True)
                             else:
@@ -1553,8 +1852,9 @@ class SpotifyAPI:
                 self.logger.warning(f"SpotifyAPI.get_album_info: Authorization error (401) for {album_id}. Token might be invalid.")
                 if not _retry_attempted:
                     self.logger.info("SpotifyAPI.get_album_info: Attempting re-authentication and retry for 401.")
-                    self.stored_token = None # Invalidate current token
-                    if self._perform_oauth_flow(): # This handles browser opening etc.
+                    # Invalidate Web API token and re-initialize session
+                    self.web_api_stored_token = None
+                    if self._load_credentials_and_init_session():
                         self.logger.info("SpotifyAPI.get_album_info: Re-authentication successful. Retrying original call.")
                         return self.get_album_info(album_id, metadata, _retry_attempted=True) # Recursive call with retry flag
                     else:
@@ -1575,8 +1875,9 @@ class SpotifyAPI:
                 self.logger.warning(f"SpotifyAPI.get_album_info: HTTPError 401 caught for {album_id}.")
                 if not _retry_attempted:
                     self.logger.info("SpotifyAPI.get_album_info: Attempting re-authentication and retry for HTTPError 401.")
-                    self.stored_token = None # Invalidate current token
-                    if self._perform_oauth_flow():
+                    # Invalidate Web API token and re-initialize session
+                    self.web_api_stored_token = None
+                    if self._load_credentials_and_init_session():
                         self.logger.info("SpotifyAPI.get_album_info: Re-authentication successful. Retrying original call.")
                         return self.get_album_info(album_id, metadata, _retry_attempted=True)
                     else:
@@ -1603,18 +1904,20 @@ class SpotifyAPI:
     def get_playlist_info(self, playlist_id: str, metadata: Optional['PlaylistInfo'] = None, _retry_attempted: bool = False) -> Optional[dict]:
         self.logger.info(f"SpotifyAPI: Attempting to get playlist info for ID: {playlist_id}{' (retry)' if _retry_attempted else ''}")
 
-        if not self.stored_token or not self.stored_token.access_token or self.stored_token.expired():
-            self.logger.info("SpotifyAPI.get_playlist_info: Token missing, invalid or expired. Attempting to load/refresh session.")
+        # Get Web API token (uses custom credentials if available, otherwise librespot token)
+        web_api_token = self._get_web_api_token()
+        if not web_api_token:
+            self.logger.info("SpotifyAPI.get_playlist_info: Token missing. Attempting to load/refresh session.")
             if not self._load_credentials_and_init_session():
                 self.logger.error("SpotifyAPI.get_playlist_info: Session initialization failed.")
                 raise SpotifyAuthError("Authentication required/failed for get_playlist_info. Session could not be initialized.")
-        
-        if not self.stored_token or not self.stored_token.access_token:
-            self.logger.error("SpotifyAPI.get_playlist_info: Still no access token after session initialization attempt.")
-            raise SpotifyAuthError("Authentication failed for get_playlist_info. No valid token.")
+            web_api_token = self._get_web_api_token()
+            if not web_api_token:
+                self.logger.error("SpotifyAPI.get_playlist_info: Still no access token after session initialization attempt.")
+                raise SpotifyAuthError("Authentication failed for get_playlist_info. No valid token.")
 
         api_url = f"https://api.spotify.com/v1/playlists/{playlist_id}"
-        headers = {"Authorization": f"Bearer {self.stored_token.access_token}"}
+        headers = {"Authorization": f"Bearer {web_api_token}"}
         params = {} # Add market if needed, Spotify API for playlists doesn't typically use it directly for main info but for tracks inside.
 
         try:
@@ -1630,7 +1933,8 @@ class SpotifyAPI:
                     next_tracks_url = playlist_data['tracks'].get('next')
                     while next_tracks_url:
                         self.logger.debug(f"SpotifyAPI.get_playlist_info: Fetching next page of tracks from {next_tracks_url}")
-                        current_headers = {"Authorization": f"Bearer {self.stored_token.access_token}"}
+                        # Use Web API token for paginated calls (same as initial request)
+                        current_headers = {"Authorization": f"Bearer {web_api_token}"}
                         paginated_response = requests.get(next_tracks_url, headers=current_headers, timeout=DEFAULT_REQUEST_TIMEOUT)
                         if paginated_response.status_code == 200:
                             paginated_data = paginated_response.json()
@@ -1638,8 +1942,9 @@ class SpotifyAPI:
                             next_tracks_url = paginated_data.get('next')
                         elif paginated_response.status_code == 401 and not _retry_attempted:
                             self.logger.warning(f"SpotifyAPI.get_playlist_info (pagination): Auth error (401) for {playlist_id}. Invalidating token, attempting re-auth.")
-                            self.stored_token = None
-                            if self._perform_oauth_flow():
+                            # Invalidate Web API token and re-initialize session
+                            self.web_api_stored_token = None
+                            if self._load_credentials_and_init_session():
                                 self.logger.info("SpotifyAPI.get_playlist_info (pagination): Re-authentication successful. Retrying original call.")
                                 return self.get_playlist_info(playlist_id, metadata, _retry_attempted=True)
                             else:
@@ -1660,8 +1965,9 @@ class SpotifyAPI:
                 self.logger.warning(f"SpotifyAPI.get_playlist_info: Auth error (401) for {playlist_id}. Token might be invalid.")
                 if not _retry_attempted:
                     self.logger.info("SpotifyAPI.get_playlist_info: Attempting re-auth and retry for 401.")
-                    self.stored_token = None
-                    if self._perform_oauth_flow():
+                    # Invalidate Web API token and re-initialize session
+                    self.web_api_stored_token = None
+                    if self._load_credentials_and_init_session():
                         self.logger.info("SpotifyAPI.get_playlist_info: Re-auth successful. Retrying call.")
                         return self.get_playlist_info(playlist_id, metadata, _retry_attempted=True)
                     else:
@@ -1682,8 +1988,9 @@ class SpotifyAPI:
                 self.logger.warning(f"SpotifyAPI.get_playlist_info: HTTPError 401 for {playlist_id}.")
                 if not _retry_attempted:
                     self.logger.info("SpotifyAPI.get_playlist_info: Attempting re-auth for HTTPError 401.")
-                    self.stored_token = None
-                    if self._perform_oauth_flow():
+                    # Invalidate Web API token and re-initialize session
+                    self.web_api_stored_token = None
+                    if self._load_credentials_and_init_session():
                         self.logger.info("SpotifyAPI.get_playlist_info: Re-auth successful. Retrying call.")
                         return self.get_playlist_info(playlist_id, metadata, _retry_attempted=True)
                     else:
@@ -1709,18 +2016,20 @@ class SpotifyAPI:
     def get_artist_info(self, artist_id: str, metadata: Optional['ArtistInfo'] = None, _retry_attempted: bool = False) -> Optional['ArtistInfo']:
         self.logger.info(f"SpotifyAPI: Attempting to get artist info for ID: {artist_id}{' (retry)' if _retry_attempted else ''}")
 
-        if not self.stored_token or not self.stored_token.access_token or self.stored_token.expired():
-            self.logger.info("SpotifyAPI.get_artist_info: Token missing, invalid or expired. Attempting to load/refresh session.")
+        # Get Web API token (uses custom credentials if available, otherwise librespot token)
+        web_api_token = self._get_web_api_token()
+        if not web_api_token:
+            self.logger.info("SpotifyAPI.get_artist_info: Token missing. Attempting to load/refresh session.")
             if not self._load_credentials_and_init_session():
                 self.logger.error("SpotifyAPI.get_artist_info: Session initialization failed.")
                 raise SpotifyAuthError("Authentication required/failed for get_artist_info. Session could not be initialized.")
-        
-        if not self.stored_token or not self.stored_token.access_token:
-            self.logger.error("SpotifyAPI.get_artist_info: Still no access token after session initialization attempt.")
-            raise SpotifyAuthError("Authentication failed for get_artist_info. No valid token.")
+            web_api_token = self._get_web_api_token()
+            if not web_api_token:
+                self.logger.error("SpotifyAPI.get_artist_info: Still no access token after session initialization attempt.")
+                raise SpotifyAuthError("Authentication failed for get_artist_info. No valid token.")
 
         artist_api_url = f"https://api.spotify.com/v1/artists/{artist_id}"
-        headers = {"Authorization": f"Bearer {self.stored_token.access_token}"}
+        headers = {"Authorization": f"Bearer {web_api_token}"}
         artist_data = None
 
         try:
@@ -1735,8 +2044,9 @@ class SpotifyAPI:
                 self.logger.warning(f"SpotifyAPI.get_artist_info (basic details): Auth error (401) for {artist_id}. Token might be invalid.")
                 if not _retry_attempted:
                     self.logger.info("SpotifyAPI.get_artist_info (basic details): Attempting re-auth and retry for 401.")
-                    self.stored_token = None
-                    if self._perform_oauth_flow():
+                    # Invalidate Web API token and re-initialize session
+                    self.web_api_stored_token = None
+                    if self._load_credentials_and_init_session():
                         self.logger.info("SpotifyAPI.get_artist_info (basic details): Re-auth successful. Retrying call.")
                         return self.get_artist_info(artist_id, metadata, _retry_attempted=True)
                     else:
@@ -1772,8 +2082,8 @@ class SpotifyAPI:
         
         all_album_items_from_api = []
         current_albums_url = artist_albums_api_url
-        # Use a new header dict for album calls, as token might have been refreshed
-        current_headers_for_albums = {"Authorization": f"Bearer {self.stored_token.access_token}"}
+        # Use Web API token for album calls (same as initial request)
+        current_headers_for_albums = {"Authorization": f"Bearer {web_api_token}"}
 
         try:
             while current_albums_url:
@@ -1787,8 +2097,9 @@ class SpotifyAPI:
                     album_params = {} # Clear params for subsequent `next` calls as they are full URLs
                 elif paginated_response.status_code == 401 and not _retry_attempted:
                     self.logger.warning(f"SpotifyAPI.get_artist_info (albums pagination): Auth error (401) for artist {artist_id}. Invalidating token, attempting re-auth.")
-                    self.stored_token = None
-                    if self._perform_oauth_flow():
+                    # Invalidate Web API token and re-initialize session
+                    self.web_api_stored_token = None
+                    if self._load_credentials_and_init_session():
                         self.logger.info("SpotifyAPI.get_artist_info (albums pagination): Re-auth successful. Retrying the entire get_artist_info call.")
                         # Retry the whole get_artist_info, as base artist info might also need re-fetch with new token
                         return self.get_artist_info(artist_id, metadata, _retry_attempted=True)
@@ -1850,19 +2161,21 @@ class SpotifyAPI:
         """Get show information from Spotify API. Returns show data in album-like format for compatibility."""
         self.logger.info(f"SpotifyAPI: Attempting to get show info for ID: {show_id}{' (retry)' if _retry_attempted else ''}")
 
-        if not self.stored_token or not self.stored_token.access_token or self.stored_token.expired():
-            self.logger.info("SpotifyAPI.get_show_info: Token missing, invalid or expired. Attempting to load/refresh session.")
+        # Get Web API token (uses custom credentials if available, otherwise librespot token)
+        web_api_token = self._get_web_api_token()
+        if not web_api_token:
+            self.logger.info("SpotifyAPI.get_show_info: Token missing. Attempting to load/refresh session.")
             if not self._load_credentials_and_init_session():
                 self.logger.error("SpotifyAPI.get_show_info: Session initialization failed.")
                 raise SpotifyAuthError("Authentication required/failed for get_show_info. Session could not be initialized.")
-        
-        if not self.stored_token or not self.stored_token.access_token:
-            self.logger.error("SpotifyAPI.get_show_info: Still no access token after session initialization attempt.")
-            raise SpotifyAuthError("Authentication failed for get_show_info. No valid token.")
+            web_api_token = self._get_web_api_token()
+            if not web_api_token:
+                self.logger.error("SpotifyAPI.get_show_info: Still no access token after session initialization attempt.")
+                raise SpotifyAuthError("Authentication failed for get_show_info. No valid token.")
 
         # First get basic show information
         api_url = f"https://api.spotify.com/v1/shows/{show_id}"
-        headers = {"Authorization": f"Bearer {self.stored_token.access_token}"}
+        headers = {"Authorization": f"Bearer {web_api_token}"}
         params = {}
         if self.user_market:
             params['market'] = self.user_market
@@ -1886,7 +2199,8 @@ class SpotifyAPI:
                 
                 while current_episodes_url:
                     self.logger.debug(f"SpotifyAPI.get_show_info: Fetching episodes from {current_episodes_url}")
-                    current_headers = {"Authorization": f"Bearer {self.stored_token.access_token}"}
+                    # Use Web API token for paginated calls (same as initial request)
+                    current_headers = {"Authorization": f"Bearer {web_api_token}"}
                     
                     try:
                         episodes_response = requests.get(current_episodes_url, headers=current_headers, params=episodes_params, timeout=DEFAULT_REQUEST_TIMEOUT)
@@ -1929,8 +2243,9 @@ class SpotifyAPI:
                 self.logger.warning(f"SpotifyAPI.get_show_info: Authorization error (401) for {show_id}. Token might be invalid.")
                 if not _retry_attempted:
                     self.logger.info("SpotifyAPI.get_show_info: Attempting re-authentication and retry for 401.")
-                    self.stored_token = None
-                    if self._perform_oauth_flow():
+                    # Invalidate Web API token and re-initialize session
+                    self.web_api_stored_token = None
+                    if self._load_credentials_and_init_session():
                         self.logger.info("SpotifyAPI.get_show_info: Re-authentication successful. Retrying original call.")
                         return self.get_show_info(show_id, metadata, _retry_attempted=True)
                     else:
@@ -1951,8 +2266,9 @@ class SpotifyAPI:
                 self.logger.warning(f"SpotifyAPI.get_show_info: HTTPError 401 caught for {show_id}.")
                 if not _retry_attempted:
                     self.logger.info("SpotifyAPI.get_show_info: Attempting re-authentication and retry for HTTPError 401.")
-                    self.stored_token = None
-                    if self._perform_oauth_flow():
+                    # Invalidate Web API token and re-initialize session
+                    self.web_api_stored_token = None
+                    if self._load_credentials_and_init_session():
                         self.logger.info("SpotifyAPI.get_show_info: Re-authentication successful. Retrying original call.")
                         return self.get_show_info(show_id, metadata, _retry_attempted=True)
                     else:
@@ -1979,17 +2295,19 @@ class SpotifyAPI:
         """Get episode details by its Spotify ID using the Web API."""
         self.logger.debug(f"SpotifyAPI.get_episode_by_id entered for episode_id: {episode_id}, market: {market}{', retry' if _retry_attempted else ''}")
 
-        if not self.stored_token or not self.stored_token.access_token or self.stored_token.expired():
-            self.logger.info("SpotifyAPI.get_episode_by_id: Token missing, invalid or expired. Attempting to load/refresh session.")
+        # Get Web API token (uses custom credentials if available, otherwise librespot token)
+        web_api_token = self._get_web_api_token()
+        if not web_api_token:
+            self.logger.info("SpotifyAPI.get_episode_by_id: Token missing. Attempting to load/refresh session.")
             if not self._load_credentials_and_init_session():
                 self.logger.error("SpotifyAPI.get_episode_by_id: Session initialization failed.")
                 raise SpotifyAuthError("Authentication required/failed for get_episode_by_id. Session could not be initialized.")
+            web_api_token = self._get_web_api_token()
+            if not web_api_token:
+                self.logger.error("SpotifyAPI.get_episode_by_id: Still no access token after session initialization attempt.")
+                raise SpotifyAuthError("Authentication failed for get_episode_by_id. No valid token.")
 
-        if not self.stored_token or not self.stored_token.access_token:
-            self.logger.error("SpotifyAPI.get_episode_by_id: Still no access token after session initialization attempt.")
-            raise SpotifyAuthError("Authentication failed for get_episode_by_id. No valid token.")
-
-        headers = {"Authorization": f"Bearer {self.stored_token.access_token}"}
+        headers = {"Authorization": f"Bearer {web_api_token}"}
         params = {}
         if market:
             params["market"] = market
@@ -2010,8 +2328,9 @@ class SpotifyAPI:
                 self.logger.warning(f"SpotifyAPI.get_episode_by_id: Auth error (401) for episode {episode_id}. Token might be invalid.")
                 if not _retry_attempted:
                     self.logger.info("SpotifyAPI.get_episode_by_id: Attempting re-auth and retry for 401.")
-                    self.stored_token = None  # Invalidate current token
-                    if self._perform_oauth_flow():
+                    # Invalidate Web API token and re-initialize session
+                    self.web_api_stored_token = None
+                    if self._load_credentials_and_init_session():
                         self.logger.info("SpotifyAPI.get_episode_by_id: Re-auth successful. Retrying call.")
                         return self.get_episode_by_id(episode_id, market, _retry_attempted=True)
                     else:
@@ -2060,8 +2379,8 @@ class SpotifyAPI:
             if not self._load_credentials_and_init_session() or not self._is_session_valid(self.librespot_session):
                  raise SpotifyAuthError("Authentication required/failed for episode download.")
         
-        # Try using TrackId with episode hex - librespot might handle episodes as tracks internally
-        track_id_obj = TrackId.from_hex(episode_id_hex)
+        # Use EpisodeId for episodes (not TrackId)
+        episode_id_obj = EpisodeId.from_hex(episode_id_hex)
         temp_file_path = None
         try:
             self.logger.info(f"Fetching librespot Episode metadata for GID hex: {episode_id_hex}")
@@ -2088,21 +2407,22 @@ class SpotifyAPI:
                         handler.addFilter(self._audio_key_filter)
             
             content_feeder = self.librespot_session.content_feeder()
-            self.logger.info(f"Attempting to load episode {episode_id_hex} using content_feeder.load_track with VorbisOnlyAudioQuality.")
-            stream_loader = content_feeder.load_track(
-                track_id_obj,
+            self.logger.info(f"Attempting to load episode {episode_id_hex} using content_feeder.load_episode with VorbisOnlyAudioQuality.")
+            stream_loader = content_feeder.load_episode(
+                episode_id_obj,
                 VorbisOnlyAudioQuality(librespot_audio_quality_mode),
                 False, 
                 None   
             )
             if not stream_loader or not hasattr(stream_loader, 'input_stream') or not stream_loader.input_stream:
-                self.logger.error(f"Librespot returned no stream_loader or input_stream for episode {episode_id_hex} (TrackId: {str(track_id_obj)}).")
+                self.logger.error(f"Librespot returned no stream_loader or input_stream for episode {episode_id_hex} (EpisodeId: {str(episode_id_obj)}).")
                 try:
-                    track_metadata_check = track_id_obj.get(self.librespot_session)
-                    if track_metadata_check and not track_metadata_check.file:
+                    # Try to get episode metadata using the proper API method
+                    episode_metadata_check = self.librespot_session.api().get_metadata_4_episode(episode_id_obj)
+                    if episode_metadata_check and not episode_metadata_check.file:
                          self.logger.error(f"Additionally, episode metadata for GID {episode_id_hex} has no associated audio files.")
                          raise SpotifyTrackUnavailableError(f"No audio files listed for episode GID {episode_id_hex} and stream_loader failed.")
-                    elif not track_metadata_check:
+                    elif not episode_metadata_check:
                          self.logger.error(f"Additionally, failed to get any episode metadata from librespot for GID hex: {episode_id_hex}")
                 except Exception as meta_err:
                      self.logger.error(f"Error during additional metadata check for {episode_id_hex} after stream_loader failure: {meta_err}")
