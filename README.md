@@ -11,25 +11,30 @@ A Spotify module for the OrpheusDL modular archival music program
 ## Installation
 
 1.  Go to your orpheusdl/ directory and run the following command:
-2.  ```
+    ```
     git clone https://github.com/bascurtiz/orpheusdl-spotify modules/spotify
     ```
-3.  ```
+2.  ```
     cd modules/spotify
     pip install --upgrade --ignore-installed -r requirements.txt
     cd..
     cd..
     ```
-4.  Run OrpheusDL once (to allow it to recognize the new module and update its main configuration):
+2.  Run OrpheusDL once (to allow it to recognize the new module and update its main configuration):
     ```
     python orpheus.py
     ```
-## Quick Usage Example (CLI)
+4.  Open `settings.json` in the `/config` folder.
 
-```
-python orpheus.py https://open.spotify.com/track/55jxzrIhEupVy1l6RDJaO5
-```
-Follow on-screen instruction for the initial authentication.
+5.  Enter your Spotify username and create an app to obtain `clientID` and `Secret` at: https://developer.spotify.com/dashboard
+
+6.  Run a download command with any legit Spotify URL:
+    ```
+    python orpheus.py https://open.spotify.com/track/1e1JKLEDKP7hEQzJfNAgPl
+    ```
+    (use `python3` on macOS)
+
+7.  Follow the instructions displayed (it will open up 2 URLs to grant permission/ask to continue in your browser).
 
 ## Configuration
 
@@ -37,6 +42,10 @@ When enabling the Spotify module in OrpheusDL (e.g., via `config/settings.json` 
 
 *   **`username`:** Enter and save it in the [GUI](https://github.com/bascurtiz/OrpheusDL-GUI) to enable Search.
 *   **`download_pause_seconds`:** A 30 seconds pause in between downloads is recommended, see: [here](https://developer.spotify.com/documentation/web-api/concepts/rate-limits) and [here](https://github.com/zotify-dev/zotify/issues/186#issuecomment-2608381052)
+*   **`clientID`:** Enter your Spotify client ID here.
+*   **`clientSecret`:** Enter your Spotify client secret here.
+* When clicking `Create App`, currently you get a message `New integrations are currently on hold while we make updates to improve reliability and performance.`
+If this is the case, and you didn't create an app yet, you can't use a borrowed Client ID and Client Secret, since those are tight to your account.
 
 ## Authentication
 
