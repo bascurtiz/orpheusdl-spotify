@@ -28,13 +28,15 @@ A Spotify module for the OrpheusDL modular archival music program
 
 5.  Enter your Spotify username and create an app to obtain `clientID` and `Secret` at: https://developer.spotify.com/dashboard
 
-6.  Run a download command with any legit Spotify URL:
+6.  Add Redirect URI: http://127.0.0.1:4381/login
+
+7.  Run a download command with any legit Spotify URL:
     ```
     python orpheus.py https://open.spotify.com/track/1e1JKLEDKP7hEQzJfNAgPl
     ```
     (use `python3` on macOS)
 
-7.  Follow the instructions displayed (it will open up 2 URLs to grant permission/ask to continue in your browser).
+8.  Follow the instructions displayed (it will open up 2 URLs to grant permission/ask to continue in your browser).
 
 ## Configuration
 
