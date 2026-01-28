@@ -340,6 +340,7 @@ class ModuleInterface:
                             'explicit': item_dict.get('explicit', False), # Default to False if not present
                             'artists': [],  # Initialize, will be populated below based on item type
                             'image_url': None, # Initialize, will be populated below
+                            'preview_url': None, # Initialize, will be populated below for tracks
                             'duration': None,  # Initialize, will be populated below
                             'year': None,      # Initialize, will be populated below
                             'additional': []   # Initialize, will be populated with genres below
@@ -428,13 +429,39 @@ class ModuleInterface:
                         
                         kwargs_for_sr['image_url'] = current_image_url
 
+                        # Extract preview_url for tracks (Spotify provides 30-second previews)
+                        # Note: preview_url is deprecated in most Spotify API endpoints.
+                        # The GUI uses lazy-loading to fetch previews from embed page when clicked.
+                        # See: https://community.spotify.com/t5/Spotify-for-Developers/Preview-URLs-Deprecated/td-p/6791368
+                        if item_dict.get('type') == 'track':
+                            # Use API preview_url if available (some tracks still have it)
+                            # If null, the GUI will lazy-load from embed page when user clicks
+                            track_preview_url = item_dict.get('preview_url')
+                            kwargs_for_sr['preview_url'] = track_preview_url
+                            
+                            if self.debug_mode:
+                                track_name = item_dict.get('name', 'Unknown')
+                                if track_preview_url:
+                                    self.logger.debug(f"[Spotify Preview] Track '{track_name}' has API preview")
+                                else:
+                                    self.logger.debug(f"[Spotify Preview] Track '{track_name}' - no API preview, will lazy-load")
+
                         processed_results.append(SearchResult(**kwargs_for_sr))
                     except Exception as e_create_sr:
                         self.logger.error(f"Error creating SearchResult for item: {item_dict.get('name')}. Error: {e_create_sr}", exc_info=True)                        
                 else:
                     self.logger.warning(f"Skipping non-dict item in raw_results: {type(item_dict)}")
 
-            self.logger.info(f"Processed {len(processed_results)} SearchResult objects.")
+            # Log summary for track searches
+            if processed_results and raw_results and raw_results[0].get('type') == 'track':
+                tracks_with_api_preview = sum(1 for r in processed_results if getattr(r, 'preview_url', None))
+                total_tracks = len(processed_results)
+                if tracks_with_api_preview > 0:
+                    self.logger.info(f"Processed {total_tracks} track results. API previews: {tracks_with_api_preview}/{total_tracks} (others will lazy-load)")
+                else:
+                    self.logger.info(f"Processed {total_tracks} track results. Previews will be lazy-loaded from embed page when clicked.")
+            else:
+                self.logger.info(f"Processed {len(processed_results)} SearchResult objects.")
             return processed_results
         except SpotifyAuthError:
             self.logger.error("Search failed: Not authenticated. This should have been caught by _ensure_authenticated.")

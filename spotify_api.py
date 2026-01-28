@@ -1620,6 +1620,71 @@ class SpotifyAPI:
             if isinstance(e, SpotifyApiError): raise
             raise SpotifyApiError(f"An unexpected error occurred while fetching track {track_id}: {e}")
 
+    def get_preview_url_from_embed(self, track_id: str) -> Optional[str]:
+        """
+        Fetch preview URL by scraping Spotify's embed page.
+        This is a fallback when the API returns null for preview_url.
+        
+        The embed page at https://open.spotify.com/embed/track/{id} contains
+        embedded JSON data with the preview URL (audioPreview field).
+        
+        See: https://community.spotify.com/t5/Spotify-for-Developers/Preview-URLs-Deprecated/td-p/6791368
+        """
+        embed_url = f"https://open.spotify.com/embed/track/{track_id}"
+        self.logger.debug(f"Fetching preview URL from embed page: {embed_url}")
+        
+        try:
+            # Use a browser-like User-Agent to avoid being blocked
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            }
+            response = requests.get(embed_url, headers=headers, timeout=10)
+            response.raise_for_status()
+            html_content = response.text
+            
+            # Look for preview URL in the HTML - it's usually in a script tag with JSON data
+            # Pattern 1: Look for audioPreview in JSON data (handles escaped URLs in JSON)
+            audio_preview_pattern = re.compile(r'"audioPreview"\s*:\s*\{\s*"url"\s*:\s*"(https:\\?/\\?/p\.scdn\.co\\?/mp3-preview\\?/[^"]+)"')
+            match = audio_preview_pattern.search(html_content)
+            if match:
+                preview_url = match.group(1)
+                # Unescape JSON escaped slashes
+                preview_url = preview_url.replace('\\/', '/').replace('\\u0026', '&')
+                self.logger.info(f"Found preview URL from embed page for track {track_id}: {preview_url[:80]}...")
+                return preview_url
+            
+            # Pattern 2: Direct p.scdn.co URL pattern (unescaped)
+            scdn_pattern = re.compile(r'(https://p\.scdn\.co/mp3-preview/[a-zA-Z0-9]+(?:\?[^"\'<>\s]*)?)')
+            match = scdn_pattern.search(html_content)
+            if match:
+                preview_url = match.group(1)
+                self.logger.info(f"Found preview URL (scdn pattern) from embed page for track {track_id}: {preview_url[:80]}...")
+                return preview_url
+            
+            # Pattern 3: Look for any mp3-preview URL with escaped slashes
+            escaped_pattern = re.compile(r'(https:\\?/\\?/p\.scdn\.co\\?/mp3-preview\\?/[a-zA-Z0-9]+(?:\\?[^"\'<>\s]*)?)')
+            match = escaped_pattern.search(html_content)
+            if match:
+                preview_url = match.group(1)
+                # Unescape JSON escaped slashes
+                preview_url = preview_url.replace('\\/', '/').replace('\\u0026', '&')
+                self.logger.info(f"Found preview URL (escaped pattern) from embed page for track {track_id}: {preview_url[:80]}...")
+                return preview_url
+            
+            # Log more details about what we found in the HTML to debug
+            self.logger.info(f"[Spotify Preview] No preview URL found in embed page for track {track_id}")
+            # Check if the page indicates no preview is available
+            if 'preview' not in html_content.lower():
+                self.logger.debug(f"[Spotify Preview] The word 'preview' not found in embed page - track likely has no preview")
+            return None
+            
+        except requests.exceptions.RequestException as e:
+            self.logger.warning(f"Failed to fetch embed page for track {track_id}: {e}")
+            return None
+        except Exception as e:
+            self.logger.warning(f"Error parsing embed page for track {track_id}: {e}")
+            return None
+
     @staticmethod
     def is_spotify_url(url_string: str) -> bool:
         if not isinstance(url_string, str):
