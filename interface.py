@@ -85,6 +85,7 @@ from .spotify_api import (
     SpotifyAPI,
     SpotifyApiError,
     SpotifyAuthError,
+    SpotifyConfigError,
     SpotifyNeedsUserRedirectError,
     SpotifyLibrespotError,
     SpotifyRateLimitDetectedError,
@@ -217,6 +218,9 @@ class ModuleInterface:
                     if self.debug_mode:
                         self.logger.info(f"[{context_message}] _ensure_authenticated returning False (session invalid despite auth attempt success report).")
                     return False
+            except SpotifyConfigError:
+                # Re-raise so caller (e.g. search) can propagate to GUI and show credentials message
+                raise
             except SpotifyAuthError as e:
                 self.logger.error(f"[{context_message}] SpotifyAuthError caught during authenticate_stream_api (non-forced) call: {e}")
                 self.printer.oprint(f"Spotify authentication failed: {e}")
