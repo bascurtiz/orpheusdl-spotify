@@ -708,6 +708,22 @@ class SpotifyAPI:
             self.logger.error("OAuth handler not initialized!")
             return False
         
+        # Check if required credentials are provided before opening browser
+        username = self.config.get('username', '') if self.config else ''
+        client_id = self.config.get('client_id', '') if self.config else ''
+        client_secret = self.config.get('client_secret', '') if self.config else ''
+        
+        # Check if username is provided (required for librespot)
+        if not username:
+            error_msg = "Spotify credentials are required. Please fill in your username, client ID, and client secret in the settings before searching or downloading."
+            self.logger.error(error_msg)
+            raise SpotifyConfigError(error_msg)
+        
+        # Check if custom client_id and client_secret are provided (recommended to avoid rate limits)
+        # Note: We allow proceeding with default CLIENT_ID, but warn if custom credentials aren't set
+        if not client_id or not client_secret:
+            self.logger.warning("Spotify custom client_id and client_secret are not set. Using default credentials may result in rate limiting. Consider setting up your own Spotify Developer app credentials.")
+        
         self.logger.info("Starting PKCE OAuth flow...")
         token_data = self.oauth_handler.perform_full_oauth_flow()
 
@@ -928,6 +944,13 @@ class SpotifyAPI:
         """Loads existing OAuth credentials or performs PKCE flow, then creates librespot session.
         Uses hybrid approach: librespot always uses Desktop client_id, Web API uses custom credentials if available."""
         self.logger.info("Attempting to authenticate and initialize session...")
+        
+        # Check if required credentials are provided before attempting any OAuth flow
+        username = self.config.get('username', '') if self.config else ''
+        if not username:
+            error_msg = "Spotify credentials are required. Please fill in your username, client ID, and client secret in the settings before searching or downloading."
+            self.logger.error(error_msg)
+            raise SpotifyConfigError(error_msg)
         
         # Step 1: Load/initialize librespot token (always uses Desktop client_id for private tokens)
         # Temporarily switch to librespot handler
