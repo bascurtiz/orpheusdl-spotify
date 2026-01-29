@@ -715,7 +715,7 @@ class SpotifyAPI:
         
         # Check if username is provided (required for librespot)
         if not username:
-            error_msg = "Spotify credentials are required. Please fill in your username, client ID, and client secret in the settings before searching or downloading."
+            error_msg = "spotify -> Spotify credentials are required. Please enter username, client ID and secret in the settings."
             self.logger.error(error_msg)
             raise SpotifyConfigError(error_msg)
         
@@ -948,7 +948,7 @@ class SpotifyAPI:
         # Check if required credentials are provided before attempting any OAuth flow
         username = self.config.get('username', '') if self.config else ''
         if not username:
-            error_msg = "Spotify credentials are required. Please fill in your username, client ID, and client secret in the settings before searching or downloading."
+            error_msg = "spotify -> Spotify credentials are required. Please enter username, client ID and secret in the settings."
             self.logger.error(error_msg)
             raise SpotifyConfigError(error_msg)
         
