@@ -1908,22 +1908,21 @@ class SpotifyAPI:
             if response.status_code == 200:
                 album_data = response.json()
                 self.logger.info(f"SpotifyAPI.get_album_info: Successfully retrieved album data for {album_id}")
-                tracks_list = []
+                # Keep full track items so interface can use them and avoid N get_track_info API calls (same pattern as Apple Music)
+                all_track_items = []
                 if 'tracks' in album_data and 'items' in album_data['tracks']:
-                    tracks_list.extend([item['id'] for item in album_data['tracks']['items'] if item and 'id' in item])
+                    all_track_items.extend(album_data['tracks']['items'])
                     next_tracks_url = album_data['tracks'].get('next')
                     while next_tracks_url:
                         self.logger.debug(f"SpotifyAPI.get_album_info: Fetching next page of tracks from {next_tracks_url}")
-                        # Use Web API token for paginated calls (same as initial request)
                         current_headers = {"Authorization": f"Bearer {web_api_token}"}
                         paginated_response = requests.get(next_tracks_url, headers=current_headers, timeout=DEFAULT_REQUEST_TIMEOUT)
                         if paginated_response.status_code == 200:
                             paginated_data = paginated_response.json()
-                            tracks_list.extend([item['id'] for item in paginated_data.get('items', []) if item and 'id' in item])
+                            all_track_items.extend(paginated_data.get('items', []))
                             next_tracks_url = paginated_data.get('next')
                         elif paginated_response.status_code == 401 and not _retry_attempted:
                             self.logger.warning(f"SpotifyAPI.get_album_info (pagination): Auth error (401) fetching next page for {album_id}. Invalidating token and attempting full re-auth flow.")
-                            # Invalidate Web API token and re-initialize session
                             self.web_api_stored_token = None
                             if self._load_credentials_and_init_session():
                                 self.logger.info("SpotifyAPI.get_album_info (pagination): Re-authentication successful. Retrying the original get_album_info call.")
@@ -1933,8 +1932,8 @@ class SpotifyAPI:
                                 raise SpotifyAuthError(f"Re-authentication failed after 401 on paginated album tracks for {album_id}.")
                         else:
                             self.logger.warning(f"SpotifyAPI.get_album_info: Failed to get next page of tracks (status: {paginated_response.status_code}). Breaking pagination.")
-                            break 
-                album_data['tracks'] = tracks_list
+                            break
+                album_data['tracks'] = {'items': all_track_items, 'total': len(all_track_items)}
                 return album_data
             elif response.status_code == 401:
                 self.logger.warning(f"SpotifyAPI.get_album_info: Authorization error (401) for {album_id}. Token might be invalid.")
@@ -2100,6 +2099,45 @@ class SpotifyAPI:
             if isinstance(e, SpotifyApiError):
                 raise
             raise SpotifyApiError(f"Unexpected error for playlist {playlist_id}: {e}")
+
+    def get_several_artists(self, artist_ids: list, _retry_attempted: bool = False) -> list:
+        """
+        Get full artist objects (including genres) for up to 50 artist IDs.
+        Returns a list of artist dicts in the same order as requested; missing/invalid IDs yield None in that slot.
+        """
+        if not artist_ids:
+            return []
+        ids_to_fetch = [str(aid) for aid in artist_ids if aid][:50]
+        if not ids_to_fetch:
+            return []
+
+        web_api_token = self._get_web_api_token()
+        if not web_api_token:
+            if not self._load_credentials_and_init_session():
+                raise SpotifyAuthError("Authentication required for get_several_artists.")
+            web_api_token = self._get_web_api_token()
+            if not web_api_token:
+                raise SpotifyAuthError("Authentication failed for get_several_artists. No valid token.")
+
+        url = "https://api.spotify.com/v1/artists"
+        headers = {"Authorization": f"Bearer {web_api_token}"}
+        params = {"ids": ",".join(ids_to_fetch)}
+
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=DEFAULT_REQUEST_TIMEOUT)
+            response.raise_for_status()
+            data = response.json()
+            artists = data.get("artists") or []
+            # API returns list aligned with requested IDs; null for invalid/missing
+            return list(artists)
+        except requests.exceptions.HTTPError as http_err:
+            if http_err.response.status_code == 401 and not _retry_attempted:
+                self.web_api_stored_token = None
+                if self._load_credentials_and_init_session():
+                    return self.get_several_artists(artist_ids, _retry_attempted=True)
+            raise SpotifyApiError(f"get_several_artists failed: {http_err.response.status_code}") from http_err
+        except requests.exceptions.RequestException as req_err:
+            raise SpotifyApiError(f"get_several_artists request error: {req_err}") from req_err
 
     def get_artist_info(self, artist_id: str, metadata: Optional['ArtistInfo'] = None, _retry_attempted: bool = False) -> Optional['ArtistInfo']:
         self.logger.info(f"SpotifyAPI: Attempting to get artist info for ID: {artist_id}{' (retry)' if _retry_attempted else ''}")

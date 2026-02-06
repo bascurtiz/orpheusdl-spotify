@@ -378,19 +378,25 @@ class ModuleInterface:
                                 if isinstance(artist, dict) and artist.get('genres'):
                                     genres.extend(artist['genres'])
                         elif item_type == 'album':
-                            # For albums, check direct genres field
+                            # For albums, show track count in additional; optionally genres
+                            total_tracks = item_dict.get('total_tracks')
+                            if total_tracks is not None:
+                                kwargs_for_sr['additional'] = [f"1 track" if total_tracks == 1 else f"{total_tracks} tracks"]
                             if item_dict.get('genres') and isinstance(item_dict['genres'], list):
                                 genres.extend(item_dict['genres'])
                         elif item_type == 'artist':
-                            # For artists, check direct genres field
-                            if item_dict.get('genres') and isinstance(item_dict['genres'], list):
-                                genres.extend(item_dict['genres'])
-                        elif item_type == 'playlist':
-                            # Playlists don't typically have genre information in search results
+                            # Do not show genres in Additional for artist search (intentionally left blank)
                             pass
+                        elif item_type == 'playlist':
+                            # Playlist track count in additional
+                            tracks_obj = item_dict.get('tracks', {})
+                            if isinstance(tracks_obj, dict):
+                                tracks_total = tracks_obj.get('total')
+                                if tracks_total is not None:
+                                    kwargs_for_sr['additional'] = [f"1 track" if tracks_total == 1 else f"{tracks_total} tracks"]
                         
-                        # Remove duplicates and populate additional field
-                        if genres:
+                        # Remove duplicates and populate additional field (for albums/playlists we already set "X tracks", don't overwrite)
+                        if genres and item_type != 'playlist' and not (item_type == 'album' and kwargs_for_sr.get('additional')):
                             unique_genres = list(dict.fromkeys(genres))  # Preserve order while removing duplicates
                             kwargs_for_sr['additional'] = unique_genres[:3]  # Limit to first 3 genres to avoid UI clutter
 
@@ -449,6 +455,11 @@ class ModuleInterface:
                                     self.logger.debug(f"[Spotify Preview] Track '{track_name}' has API preview")
                                 else:
                                     self.logger.debug(f"[Spotify Preview] Track '{track_name}' - no API preview, will lazy-load")
+
+                        if item_type == 'playlist':
+                            tracks_total = (item_dict.get('tracks') or {}).get('total') if isinstance(item_dict.get('tracks'), dict) else None
+                            if tracks_total is None or tracks_total == 0:
+                                continue
 
                         processed_results.append(SearchResult(**kwargs_for_sr))
                     except Exception as e_create_sr:
@@ -1116,43 +1127,51 @@ class ModuleInterface:
                 cover_url = album_dict['images'][0].get('url')
 
             parsed_tracks: List[TrackInfo] = []
-            # Correctly get the list of track IDs from album_data['tracks']
+            # Use full track items from API when available to avoid N get_track_info API calls (same pattern as Apple Music)
+            track_items_from_api = None
             track_ids_from_album_data = album_dict.get('tracks', [])
-            
-            if not isinstance(track_ids_from_album_data, list):
-                self.logger.warning(f"Expected album_data['tracks'] to be a list of IDs for album {album_name}, but got {type(track_ids_from_album_data)}. Setting to empty list.")
-                
-                # Try to extract track IDs if it's a dict with 'items'
-                if isinstance(track_ids_from_album_data, dict) and 'items' in track_ids_from_album_data:
-                    track_ids_from_album_data = [item.get('id') for item in track_ids_from_album_data.get('items', []) if item and item.get('id')]
-                else:
-                    track_ids_from_album_data = []
-            
-            self.logger.debug(f"Album '{album_name}' has {len(track_ids_from_album_data)} track IDs from API response.")
-            
-            if self.controller and hasattr(self.controller, 'settings'): # Check if controller and settings exist
-                codec_opts = self.controller.settings.get_codec_options(self.name) # type: ignore
+
+            if isinstance(track_ids_from_album_data, dict) and 'items' in track_ids_from_album_data:
+                track_items_from_api = track_ids_from_album_data.get('items', [])
+                self.logger.debug(f"Album '{album_name}' has {len(track_items_from_api)} full track items from API (no extra get_track_info calls).")
+            elif isinstance(track_ids_from_album_data, list):
+                self.logger.debug(f"Album '{album_name}' has {len(track_ids_from_album_data)} track IDs from API response.")
+            else:
+                track_ids_from_album_data = []
+
+            if self.controller and hasattr(self.controller, 'settings'):
+                codec_opts = self.controller.settings.get_codec_options(self.name)  # type: ignore
                 if self.debug_mode:
                     self.logger.debug(f"_parse_album_info: Codec options for {self.name}: {codec_opts}")
             else:
-                codec_opts = None  # Set to None if not available
+                codec_opts = None
                 if self.debug_mode:
                     self.logger.warning("_parse_album_info: Module controller or settings not available, cannot get codec options. Defaulting to None.")
 
-            for track_id in track_ids_from_album_data:
-                if not track_id:
-                    continue  # Skip empty or None track IDs
-                
-                try:
-                    track_info = self.get_track_info(track_id, quality_tier=QualityEnum.HIGH, codec_options=codec_opts)
-                    
-                    if track_info:
-                        parsed_tracks.append(track_info)
-                    else:
-                        self.logger.warning(f"Failed to get track info for track ID {track_id} in album {album_name}")
-                except Exception as track_error:
-                    self.logger.error(f"Error getting track info for track ID {track_id} in album {album_name}: {track_error}")
-                    # Continue processing other tracks even if one fails
+            if track_items_from_api:
+                for i, item in enumerate(track_items_from_api):
+                    if not item or not isinstance(item, dict):
+                        continue
+                    try:
+                        track_info = self._parse_track_info(item, index=i + 1)
+                        if track_info:
+                            parsed_tracks.append(track_info)
+                        else:
+                            self.logger.warning(f"Failed to parse track at index {i + 1} in album {album_name}")
+                    except Exception as parse_err:
+                        self.logger.error(f"Error parsing track in album {album_name}: {parse_err}")
+            else:
+                for track_id in track_ids_from_album_data:
+                    if not track_id:
+                        continue
+                    try:
+                        track_info = self.get_track_info(track_id, quality_tier=QualityEnum.HIGH, codec_options=codec_opts)
+                        if track_info:
+                            parsed_tracks.append(track_info)
+                        else:
+                            self.logger.warning(f"Failed to get track info for track ID {track_id} in album {album_name}")
+                    except Exception as track_error:
+                        self.logger.error(f"Error getting track info for track ID {track_id} in album {album_name}: {track_error}")
             
             if parsed_tracks: # After fetching all tracks, determine if album is explicit
                 is_explicit_album = any(track.explicit for track in parsed_tracks if hasattr(track, 'explicit'))
