@@ -175,22 +175,38 @@ class ModuleInterface:
                 
                 if not auth_attempt_result:
                     self.logger.warning(f"[{context_message}] authenticate_stream_api (non-forced) indicated failure. Setting logged_in=False.")
-                    # Check if there's a more specific error message from OAuth handler
-                    oauth_error = None
-                    if (self.spotify_api.librespot_oauth_handler and 
-                        hasattr(self.spotify_api.librespot_oauth_handler, 'error_message') and 
-                        self.spotify_api.librespot_oauth_handler.error_message):
-                        oauth_error = self.spotify_api.librespot_oauth_handler.error_message
-                    
-                    credentials_path = self.spotify_api.credentials_file_path
-                    if oauth_error:
-                        error_msg = f"Spotify authentication failed: {oauth_error}\n\n"
+                    # Check if credentials are missing (should have raised SpotifyConfigError, but handle edge case)
+                    cfg = self.spotify_api.config or {}
+                    username = (cfg.get('username') or '').strip()
+                    client_id = (cfg.get('client_id') or '').strip()
+                    client_secret = (cfg.get('client_secret') or '').strip()
+                    missing = []
+                    if not username:
+                        missing.append("username")
+                    if not client_id:
+                        missing.append("client ID")
+                    if not client_secret:
+                        missing.append("client secret")
+                    if missing:
+                        error_msg = (
+                            "Spotify credentials are missing in settings.json. "
+                            f"Please fill in: {', '.join(missing)}. "
+                            "Use the OrpheusDL GUI Settings tab (Spotify) or edit config/settings.json directly."
+                        )
                     else:
-                        error_msg = "Spotify authentication failed or session could not be refreshed.\nYour tokens may have expired.\n\n"
-                    
-                    error_msg += f"If this problem persists, try manually deleting the credentials file:\n{credentials_path}\n"
-                    error_msg += "Then run the command again to trigger a fresh authentication."
-                    
+                        # Credentials present but auth failed - likely expired tokens
+                        oauth_error = None
+                        if (self.spotify_api.librespot_oauth_handler and
+                            hasattr(self.spotify_api.librespot_oauth_handler, 'error_message') and
+                            self.spotify_api.librespot_oauth_handler.error_message):
+                            oauth_error = self.spotify_api.librespot_oauth_handler.error_message
+                        credentials_path = self.spotify_api.credentials_file_path
+                        if oauth_error:
+                            error_msg = f"Spotify authentication failed: {oauth_error}\n\n"
+                        else:
+                            error_msg = "Spotify authentication failed or session could not be refreshed.\nYour tokens may have expired.\n\n"
+                        error_msg += f"If this problem persists, try manually deleting the credentials file:\n{credentials_path}\n"
+                        error_msg += "Then run the command again to trigger a fresh authentication."
                     self.printer.oprint(error_msg)
                     self.logged_in = False
                     if self.debug_mode:
@@ -515,6 +531,8 @@ class ModuleInterface:
             self.logger.warning(f"Failed to get track or episode info for ID: {track_id}")
             return None
             
+        except SpotifyConfigError:
+            raise
         except SpotifyItemNotFoundError:
             self.logger.warning(f"Track/Episode ID {track_id} not found")
             return None
@@ -593,6 +611,8 @@ class ModuleInterface:
                 self.logger.error(f"Both album and show processing failed for {actual_album_id_str}")
                 return None
 
+        except SpotifyConfigError:
+            raise
         except SpotifyAuthError as sae:
             self.logger.error(f"Authentication error during Spotify get_album_info: {sae}")
             self.printer.oprint(f"[Error] Authentication error: {sae}")
@@ -633,6 +653,8 @@ class ModuleInterface:
             
             return playlist_info_obj
 
+        except SpotifyConfigError:
+            raise
         except SpotifyAuthError: 
             self.logger.error("get_playlist_info failed: Not authenticated.")
             self.printer.oprint("Failed to get playlist info: Spotify authentication is required.")
@@ -658,6 +680,8 @@ class ModuleInterface:
 
         try:
             return self.spotify_api.get_artist_info(artist_id, metadata=metadata)
+        except SpotifyConfigError:
+            raise
         except SpotifyApiError as e:
             self.module_error(f"Failed to get artist info for {artist_id}: {e}")
             return None

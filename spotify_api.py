@@ -713,16 +713,22 @@ class SpotifyAPI:
         client_id = self.config.get('client_id', '') if self.config else ''
         client_secret = self.config.get('client_secret', '') if self.config else ''
         
-        # Check if username is provided (required for librespot)
+        # Check if required credentials are provided
+        missing = []
         if not username:
-            error_msg = "spotify -> Spotify credentials are required. Please fill in your username, client ID and secret in the settings."
+            missing.append("username")
+        if not client_id:
+            missing.append("client ID")
+        if not client_secret:
+            missing.append("client secret")
+        if missing:
+            error_msg = (
+                "Spotify credentials are missing in settings.json. "
+                f"Please fill in: {', '.join(missing)}. "
+                "Use the OrpheusDL GUI Settings tab (Spotify) or edit config/settings.json directly."
+            )
             self.logger.error(error_msg)
             raise SpotifyConfigError(error_msg)
-        
-        # Check if custom client_id and client_secret are provided (recommended to avoid rate limits)
-        # Note: We allow proceeding with default CLIENT_ID, but warn if custom credentials aren't set
-        if not client_id or not client_secret:
-            self.logger.warning("Spotify custom client_id and client_secret are not set. Using default credentials may result in rate limiting. Consider setting up your own Spotify Developer app credentials.")
         
         self.logger.info("Starting PKCE OAuth flow...")
         token_data = self.oauth_handler.perform_full_oauth_flow()
@@ -946,9 +952,22 @@ class SpotifyAPI:
         self.logger.info("Attempting to authenticate and initialize session...")
         
         # Check if required credentials are provided before attempting any OAuth flow
-        username = self.config.get('username', '') if self.config else ''
+        username = (self.config.get('username', '') or '').strip() if self.config else ''
+        client_id = (self.config.get('client_id', '') or '').strip() if self.config else ''
+        client_secret = (self.config.get('client_secret', '') or '').strip() if self.config else ''
+        missing = []
         if not username:
-            error_msg = "spotify -> Spotify credentials are required. Please fill in your username, client ID and secret in the settings."
+            missing.append("username")
+        if not client_id:
+            missing.append("client ID")
+        if not client_secret:
+            missing.append("client secret")
+        if missing:
+            error_msg = (
+                "Spotify credentials are missing in settings.json. "
+                f"Please fill in: {', '.join(missing)}. "
+                "Use the OrpheusDL GUI Settings tab (Spotify) or edit config/settings.json directly."
+            )
             self.logger.error(error_msg)
             raise SpotifyConfigError(error_msg)
         
