@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 import sys
 import io
 import contextlib
+import platform
 
 from utils.vendor_bootstrap import bootstrap_vendor_paths
 bootstrap_vendor_paths()
@@ -100,6 +101,22 @@ DESKTOP_CLIENT_ID = "65b708073fc0480ea92a077233ca87bd"
 SPOTIFY_TOKEN_URL = "https://api.spotify.com/api/token" 
 CREDENTIALS_FILE_NAME = "credentials.json"
 
+
+def _get_spotify_credentials_dir() -> str:
+    """Return the directory for Spotify credentials (credentials.json, librespot cache).
+    On macOS when running as a bundled .app, use ~/Library/Application Support/OrpheusDL GUI/config/spotify
+    so config is writable (the .app bundle is read-only). Otherwise use project config/spotify relative to module."""
+    is_frozen = getattr(sys, "frozen", False)
+    is_macos = platform.system() == "Darwin"
+    if is_macos and is_frozen:
+        exe_path = getattr(sys, "executable", "") or ""
+        meipass = getattr(sys, "_MEIPASS", "") or ""
+        if ".app/Contents" in exe_path or ".app" in meipass:
+            app_support = os.path.expanduser("~/Library/Application Support/OrpheusDL GUI")
+            cred_dir = os.path.join(app_support, "config", "spotify")
+            return os.path.abspath(cred_dir)
+    # Default: next to project root (config/spotify)
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "config", "spotify"))
 
 
 # --- PKCE Helper Functions ---
@@ -577,10 +594,10 @@ class SpotifyAPI:
         
         self.logger.debug("Added LibrespotAudioKeyFilter to suppress noisy audio key error messages and rate limit warnings")
 
-        # Determine script directory for credentials.json - use config/spotify/ subdirectory        
-        self.credentials_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "config", "spotify"))
-        os.makedirs(self.credentials_dir, exist_ok=True) # Ensure directory exists
-        self.credentials_file_path = os.path.join(self.credentials_dir, CREDENTIALS_FILE_NAME)       
+        # Determine credentials directory. On macOS bundled apps use Application Support so config is writable.
+        self.credentials_dir = _get_spotify_credentials_dir()
+        os.makedirs(self.credentials_dir, exist_ok=True)  # Ensure directory exists
+        self.credentials_file_path = os.path.join(self.credentials_dir, CREDENTIALS_FILE_NAME)
         self.logger.info(f"Credentials will be stored/loaded from: {self.credentials_file_path}")
 
     def _save_credentials(self, token_obj: StoredToken, username: Optional[str] = "PKCE_USER"):
