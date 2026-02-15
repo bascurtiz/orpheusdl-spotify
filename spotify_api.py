@@ -1247,6 +1247,29 @@ class SpotifyAPI:
             self.logger.error(f"SpotifyAPI._fetch_user_market: Unexpected error: {e}", exc_info=True)
             return None
 
+    def _gid_to_base62(self, gid: bytes) -> str:
+        """Converts a GID (bytes) to a Spotify Base62 ID string."""
+        try:
+            # Convert bytes to int
+            num = int.from_bytes(gid, byteorder='big')
+            
+            alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            base = 62
+            
+            if num == 0:
+                return alphabet[0]
+            
+            arr = []
+            while num:
+                num, rem = divmod(num, base)
+                arr.append(alphabet[rem])
+            
+            arr.reverse()
+            return ''.join(arr).rjust(22, '0') # Standard spotify IDs are 22 chars
+        except Exception as e:
+            self.logger.error(f"Error converting GID bytes to Base62: {e}")
+            return ""
+
     def _convert_base62_to_gid_hex(self, base62_id: str) -> Optional[str]:
         if not base62_id:
             self.logger.warning("Attempted to convert an empty base62_id to GID hex.")
@@ -1868,8 +1891,8 @@ class SpotifyAPI:
         try:
             web_api_track_data = self.get_track_by_id(track_id) 
             if not web_api_track_data:
-                self.logger.warning(f"No track data returned from Web API for ID: {track_id}")
-                return None
+                self.logger.warning(f"No track data returned from Web API for ID: {track_id}. Attempting Librespot fallback.")
+                return self.get_track_via_librespot(track_id)
             name = web_api_track_data.get('name')
             duration_ms = web_api_track_data.get('duration_ms')
             explicit = web_api_track_data.get('explicit', False)
@@ -1926,17 +1949,17 @@ class SpotifyAPI:
             self.logger.debug(f"Successfully created TrackInfo for {track_id}: {name}. Returning object.")
             return track_info_instance
         except SpotifyItemNotFoundError:
-            self.logger.warning(f"Track with ID '{track_id}' not found via Spotify Web API.")
-            return None
+            self.logger.warning(f"Track with ID '{track_id}' not found via Spotify Web API. Attempting Librespot fallback from exception.")
+            return self.get_track_via_librespot(track_id)
         except SpotifyAuthError as auth_err:
-            self.logger.error(f"Authentication error while getting track info for {track_id}: {auth_err}", exc_info=True)
-            raise
+            self.logger.error(f"Authentication error while getting track info for {track_id}: {auth_err}. Attempting Librespot fallback from exception.")
+            return self.get_track_via_librespot(track_id)
         except SpotifyApiError as api_err:
-            self.logger.error(f"API error while getting track info for {track_id}: {api_err}", exc_info=True)
-            return None
+            self.logger.error(f"API error while getting track info for {track_id}: {api_err}. Attempting Librespot fallback from exception.")
+            return self.get_track_via_librespot(track_id)
         except Exception as e:
-            self.logger.error(f"Unexpected error in get_track_info for track_id {track_id}: {e}", exc_info=True)
-            return None
+            self.logger.error(f"Unexpected error in get_track_info for track_id {track_id}: {e}. Attempting Librespot fallback from exception.")
+            return self.get_track_via_librespot(track_id)
 
     def get_album_info(self, album_id: str, metadata: Optional['AlbumInfo'] = None, _retry_attempted: bool = False) -> Optional[dict]:
         self.logger.info(f"SpotifyAPI: Attempting to get album info for ID: {album_id}{' (retry)' if _retry_attempted else ''}")
@@ -2045,6 +2068,135 @@ class SpotifyAPI:
             if isinstance(e, SpotifyApiError):
                 raise
             raise SpotifyApiError(f"An unexpected error occurred while fetching album {album_id}: {e}")
+
+    def get_track_via_librespot(self, track_id: str) -> Optional[TrackInfo]:
+        """
+        Fallback method to get track info using Librespot (Mercury) when Web API fails.
+        """
+        self.logger.info(f"SpotifyAPI: Attempting to get track {track_id} via Librespot fallback...")
+        
+        if not self.librespot_session:
+            self.logger.warning("SpotifyAPI.get_track_via_librespot: No librespot session available.")
+            if not self._load_credentials_and_init_session():
+                 self.logger.error("SpotifyAPI.get_track_via_librespot: Failed to init session.")
+                 return None
+
+        try:
+            # Use Librespot's API to get track
+            # track_uri = f"spotify:track:{track_id}"
+            # t_id = TrackId.from_uri(track_uri) # This might not be directly exposed or needed if we use mercury
+            # But we can use the mercury client directly with the correct URL
+            
+            # Construct Mercury URL for track metadata
+            # usually: hm://metadata/4/track/<hex_id>
+            # But librespot has helpers. Let's try to use the session/mercury.
+            
+            # Convert base62 ID to hex
+            gid_hex = self._convert_base62_to_gid_hex(track_id)
+            if not gid_hex:
+                self.logger.error(f"SpotifyAPI.get_track_via_librespot: Could not convert {track_id} to GID.")
+                return None
+                
+            # We can use the 'spclient' or similar if available, or build the mercury request.
+            # Looking at how `get_playlist_via_librespot` works, it uses `self.librespot_session.api().get_playlist(p_id)`.
+            # Let's see if we can use `self.librespot_session.api().get_metadata_4_track(t_id)` or similar?
+            # Or `get_track(t_id)`?
+            
+            # The python-librespot usage:
+            # session.api().get_metadata_4_track(track_id)
+            
+            # We need to construct a TrackId object.
+            # From imports: from librespot.metadata import TrackId
+            
+            params = { 'id': track_id }
+            t_id = TrackId.from_base62(track_id)
+            
+            if not self.librespot_session.api():
+                 self.logger.error("SpotifyAPI.get_track_via_librespot: Session API not ready.")
+                 return None
+
+            try:
+                # Try getting track metadata
+                track_obj = self.librespot_session.api().get_metadata_4_track(t_id)
+            except Exception as e:
+                self.logger.warning(f"SpotifyAPI.get_track_via_librespot: Failed to get track via api().get_track(): {e}")
+                return None
+            
+            if not track_obj:
+                self.logger.warning("SpotifyAPI.get_track_via_librespot: Librespot returned None.")
+                return None
+
+            self.logger.info(f"SpotifyAPI.get_track_via_librespot: Successfully retrieved track via Librespot.")
+            
+            # Convert Librespot Track object to TrackInfo
+            name = track_obj.name
+            duration_ms = track_obj.duration
+            explicit = track_obj.explicit
+            
+            # Artists
+            artist_names = [a.name for a in track_obj.artist]
+            artist_ids = [self._gid_to_base62(a.gid) for a in track_obj.artist]
+            
+            # Album
+            album_name = track_obj.album.name
+            album_id = self._gid_to_base62(track_obj.album.gid)
+            
+            # Date/Year
+            release_year = 0
+            if track_obj.album.date and track_obj.album.date.year:
+                release_year = track_obj.album.date.year
+            
+            # Release Date string
+            release_date_str = f"{release_year}-01-01" # Default/approx if full date missing
+            if track_obj.album.date:
+                 # Construct date string if month/day available
+                 y = track_obj.album.date.year
+                 m = track_obj.album.date.month if track_obj.album.date.month else 1
+                 d = track_obj.album.date.day if track_obj.album.date.day else 1
+                 release_date_str = f"{y:04d}-{m:02d}-{d:02d}"
+
+            # Cover
+            cover_url = None
+            # Librespot covers are hex strings in `cover_group`
+            if track_obj.album.cover_group and track_obj.album.cover_group.image:
+                # Find largest? or first
+                for img in track_obj.album.cover_group.image:
+                    # img.file_id is bytes, convert to hex
+                    file_id_hex = img.file_id.hex()
+                    cover_url = f"https://i.scdn.co/image/{file_id_hex}"
+                    break # Use first found
+            
+            # Tags
+            tags_obj = Tags(
+                album_artist=artist_names, # fallback
+                track_number=str(track_obj.number),
+                total_tracks=None, # Not easily available in track obj
+                disc_number=str(track_obj.disc_number),
+                release_date=release_date_str,
+            )
+            
+            track_info_instance = TrackInfo(
+                id=track_id,
+                name=name,
+                artists=artist_names,
+                artist_id=artist_ids[0] if artist_ids else None,
+                album_id=album_id,
+                album=album_name,
+                duration=duration_ms // 1000 if duration_ms else 0,
+                cover_url=cover_url,
+                explicit=explicit,
+                tags=tags_obj,
+                codec=CodecEnum.VORBIS, 
+                release_year=release_year,
+                gid_hex=gid_hex,
+            )
+            
+            self.logger.debug(f"Successfully created TrackInfo details via Librespot for {track_id}. Returning object.")
+            return track_info_instance
+
+        except Exception as e:
+            self.logger.error(f"SpotifyAPI.get_track_via_librespot: Error: {e}", exc_info=True)
+            return None
 
     def get_playlist_via_librespot(self, playlist_id: str) -> Optional[dict]:
         """
