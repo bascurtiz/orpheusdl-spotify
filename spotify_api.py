@@ -32,7 +32,7 @@ import hashlib
 from librespot.core import Session as LibrespotSession
 from librespot.proto import Authentication_pb2
 import librespot.core
-from librespot.metadata import TrackId, EpisodeId
+from librespot.metadata import TrackId, EpisodeId, PlaylistId
 from librespot.audio.decoders import AudioQuality as LibrespotAudioQualityEnum, VorbisOnlyAudioQuality
 from librespot.core import TokenProvider as LibrespotTokenProvider 
 from librespot.mercury import MercuryClient
@@ -671,6 +671,19 @@ class SpotifyAPI:
 
             loaded_token = StoredToken.from_dict(token_data_from_file)
 
+            # Check if token has all required scopes
+            loaded_scopes = set(loaded_token.scopes)
+            required_scopes = set(OAUTH_SCOPES)
+            missing_scopes = required_scopes - loaded_scopes
+            if missing_scopes:
+                self.logger.warning(f"Stored token is missing required scopes: {missing_scopes}. Full re-authentication required.")
+                try:
+                    os.remove(self.credentials_file_path)
+                    self.logger.info(f"Removed credentials file {self.credentials_file_path} due to missing scopes.")
+                except OSError as e:
+                    self.logger.error(f"Error removing credentials file: {e}")
+                return False
+
             if loaded_token.expired():
                 self.logger.info("Existing token is expired. Attempting to refresh...")
                 if not loaded_token.refresh_token:
@@ -1253,8 +1266,10 @@ class SpotifyAPI:
     def search(self, query_type_enum_or_str, query_str: str, track_info=None, market: Optional[str] = None, limit: int = 20, _retry_attempted: bool = False) -> List[dict]:
         self.logger.info(f"SpotifyAPI.search: type='{query_type_enum_or_str}', query='{query_str}', limit={limit}{', retry' if _retry_attempted else ''}")
         
-        # Validate and adjust limit - Spotify API has a maximum of 50 per request
-        SPOTIFY_MAX_LIMIT_PER_REQUEST = 50
+        # Validate and adjust limit - Spotify API has a maximum of 50 per request. 
+        # HOWEVER, due to an issue (likely with the specific Client ID), sending ANY 'limit' parameter causes 400 Bad Request.
+        # We must rely on the default limit (20) and paginate accordingly.
+        SPOTIFY_MAX_LIMIT_PER_REQUEST = 20
         total_requested = limit
         if limit > SPOTIFY_MAX_LIMIT_PER_REQUEST:
             self.logger.info(f"SpotifyAPI.search: Requested limit {limit} exceeds Spotify's max of {SPOTIFY_MAX_LIMIT_PER_REQUEST}. Will use pagination to fetch all requested results.")
@@ -1295,13 +1310,13 @@ class SpotifyAPI:
             params = {
                 'q': query_str, 
                 'type': query_type_str, 
-                'limit': current_limit,
+                # 'limit': current_limit, # CRITICAL FIX: Do not send limit, it causes 400. Use default 20.
                 'offset': offset
             }
             if effective_market:
                 params['market'] = effective_market
                 
-            self.logger.debug(f"SpotifyAPI.search: Making request with limit={current_limit}, offset={offset}")
+            self.logger.debug(f"SpotifyAPI.search: Making request with offset={offset} (limit implicitly {SPOTIFY_MAX_LIMIT_PER_REQUEST})")
 
             try:
                 response = requests.get(search_url, headers=headers, params=params, timeout=DEFAULT_REQUEST_TIMEOUT)
@@ -1316,13 +1331,20 @@ class SpotifyAPI:
                         self.logger.info(f"No more {plural_type} found for '{query_str}' at offset {offset}.")
                         break
                     
-                    all_items.extend(items)
+                    # Filter out None items which might be returned by API for restricted content
+                    valid_items = [item for item in items if item is not None]
+                    all_items.extend(valid_items)
                     offset += len(items)
                     
                     # Check if we got fewer items than requested - indicates end of results
-                    if len(items) < current_limit:
-                        self.logger.info(f"Received {len(items)} items (less than requested {current_limit}), indicating end of results.")
-                        break
+                    # if len(items) < current_limit:
+                    #     self.logger.info(f"Received {len(items)} items (less than requested {current_limit}), indicating end of results.")
+                    #     break
+                    
+                    # Better check: if 'next' is missing, we are definitely done.
+                    if not search_results[plural_type].get("next"):
+                         self.logger.info(f"No 'next' URL in response, indicating end of results.")
+                         break
                         
                 else:
                     self.logger.warning(f"'{plural_type}' or '{plural_type}.items' not in search response for query '{query_str}'. Response keys: {list(search_results.keys())}")
@@ -1379,7 +1401,7 @@ class SpotifyAPI:
                 raise SpotifyApiError(f"An unexpected error occurred during search for '{query_str}': {e}")
         
         self.logger.info(f"SpotifyAPI.search: Successfully retrieved {len(all_items)} items for '{query_str}' (requested: {total_requested})")
-        return all_items
+        return all_items[:total_requested]
 
     def _save_stream_to_temp_file(self, stream_object, determined_codec_enum: CodecEnum) -> Optional[str]:
         temp_file_path = None
@@ -2024,6 +2046,77 @@ class SpotifyAPI:
                 raise
             raise SpotifyApiError(f"An unexpected error occurred while fetching album {album_id}: {e}")
 
+    def get_playlist_via_librespot(self, playlist_id: str) -> Optional[dict]:
+        """
+        Fallback method to get playlist info using Librespot (Mercury) when Web API fails (e.g. 403).
+        """
+        self.logger.info(f"SpotifyAPI: Attempting to get playlist {playlist_id} via Librespot fallback...")
+        
+        if not self.librespot_session:
+            self.logger.warning("SpotifyAPI.get_playlist_via_librespot: No librespot session available.")
+            if not self._load_credentials_and_init_session():
+                 self.logger.error("SpotifyAPI.get_playlist_via_librespot: Failed to init session.")
+                 return None
+
+        try:
+            # Use Librespot's API to get playlist
+            playlist_uri = f"spotify:playlist:{playlist_id}"
+            import librespot.metadata
+            p_id = PlaylistId.from_uri(playlist_uri)
+            
+            # Allow some time for session to be fully ready if just created
+            if not self.librespot_session.api():
+                 self.logger.error("SpotifyAPI.get_playlist_via_librespot: Session API not ready.")
+                 return None
+
+            playlist_obj = self.librespot_session.api().get_playlist(p_id)
+            
+            if not playlist_obj:
+                self.logger.warning("SpotifyAPI.get_playlist_via_librespot: Librespot returned None.")
+                return None
+
+            self.logger.info(f"SpotifyAPI.get_playlist_via_librespot: Successfully retrieved playlist via Librespot.")
+            
+            # Convert Librespot Playlist object to dict format expected by interface
+            name = "Unknown Playlist (Librespot)"
+            if hasattr(playlist_obj, 'attributes') and hasattr(playlist_obj.attributes, 'name'):
+                name = playlist_obj.attributes.name
+                
+            # Parse tracks
+            items = []
+            if hasattr(playlist_obj, 'contents') and hasattr(playlist_obj.contents, 'items'):
+                for item in playlist_obj.contents.items:
+                    # item uri is usually "spotify:track:..."
+                    uri = item.uri
+                    # functionality to parse uri to id
+                    if uri and ":track:" in uri:
+                        t_id = uri.split(":track:")[-1]
+                        # We just need the track object with an ID for interface.py to fetch details later
+                        items.append({
+                            'track': {
+                                'id': t_id,
+                                'name': 'Loading...', # Placeholder, will be fetched by get_track_info
+                                'artists': [{'name': 'Loading...'}],
+                                'duration_ms': 0
+                            }
+                        })
+            
+            playlist_dict = {
+                'id': playlist_id,
+                'name': name,
+                'tracks': {
+                    'items': items,
+                    'total': len(items)
+                },
+                'description': getattr(playlist_obj.attributes, 'description', '') if hasattr(playlist_obj, 'attributes') else '',
+                'images': [] 
+            }
+            return playlist_dict
+
+        except Exception as e:
+            self.logger.error(f"SpotifyAPI.get_playlist_via_librespot: Error: {e}", exc_info=True)
+            return None
+
     def get_playlist_info(self, playlist_id: str, metadata: Optional['PlaylistInfo'] = None, _retry_attempted: bool = False) -> Optional[dict]:
         self.logger.info(f"SpotifyAPI: Attempting to get playlist info for ID: {playlist_id}{' (retry)' if _retry_attempted else ''}")
 
@@ -2077,6 +2170,63 @@ class SpotifyAPI:
                             self.logger.warning(f"SpotifyAPI.get_playlist_info: Failed to get next page of playlist tracks for {playlist_id} (status: {paginated_response.status_code}). Breaking.")
                             break
                 
+                # Fallback: If no tracks found so far (e.g. 'tracks' key missing or empty), try fetching from /tracks endpoint explicitly
+                if not all_track_items:
+                    self.logger.info(f"SpotifyAPI.get_playlist_info: No tracks found in main object. Attempting to fetch explicitly from /playlists/{playlist_id}/tracks")
+                    tracks_api_url = f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks"
+                    tracks_params = {}
+                    if self.user_market:
+                        tracks_params['market'] = self.user_market
+                    
+                    current_tracks_url = tracks_api_url
+                    while current_tracks_url:
+                        self.logger.debug(f"SpotifyAPI.get_playlist_info: Fetching tracks from {current_tracks_url}")
+                        try:
+                            # Use Web API token
+                            t_headers = {"Authorization": f"Bearer {web_api_token}"}
+                            t_response = requests.get(current_tracks_url, headers=t_headers, params=tracks_params if current_tracks_url == tracks_api_url else None, timeout=DEFAULT_REQUEST_TIMEOUT)
+                            
+                            if t_response.status_code == 200:
+                                t_data = t_response.json()
+                                all_track_items.extend(t_data.get('items', []))
+                                current_tracks_url = t_data.get('next')
+                                tracks_params = {} # Clear params for next URL
+                                self.logger.warning("SpotifyAPI.get_playlist_info (tracks fallback): Auth error (403) with market param. Retrying without market.")
+                                tracks_params.pop('market', None)
+                                # Continue loop to retry the same URL without market
+                                continue
+                            elif t_response.status_code == 403:
+                                self.logger.warning("SpotifyAPI.get_playlist_info (tracks fallback): Auth error (403) even without market. Attempting Librespot fallback.")
+                                librespot_playlist = self.get_playlist_via_librespot(playlist_id)
+                                if librespot_playlist and 'tracks' in librespot_playlist:
+                                    # Merge/Use the librespot result
+                                    # Since we are in the fallback for *missing* tracks, we can just use these items.
+                                    # But we need to match the structure 'items' list of objects.
+                                    # The helper above returns {'tracks': {'items': [...]}}
+                                    # We can assume correct structure.
+                                    self.logger.info("SpotifyAPI.get_playlist_info: Librespot fallback successful. Using retrieved tracks.")
+                                    # We need to replace the *entire* playlist object or just append tracks?
+                                    # The initial playlist_data was stripped/empty.
+                                    # Let's populate all_track_items from librespot and break
+                                    all_track_items = librespot_playlist['tracks']['items']
+                                    # Also update name if it was missing? 
+                                    if librespot_playlist.get('name') and (not playlist_data.get('name') or playlist_data.get('name') == ''):
+                                         playlist_data['name'] = librespot_playlist['name']
+                                    break
+                                else:
+                                    self.logger.error("SpotifyAPI.get_playlist_info: Librespot fallback failed.")
+                                    break
+
+                            elif t_response.status_code == 401 and not _retry_attempted:
+                                self.logger.warning("SpotifyAPI.get_playlist_info (tracks fallback): Auth error (401).")
+                                break # Do not recurse here to simplify
+                            else:
+                                self.logger.warning(f"SpotifyAPI.get_playlist_info (tracks fallback): Failed status {t_response.status_code}")
+                                break
+                        except Exception as e:
+                            self.logger.error(f"SpotifyAPI.get_playlist_info (tracks fallback): Error: {e}")
+                            break
+
                 if 'tracks' in playlist_data and isinstance(playlist_data['tracks'], dict):
                     playlist_data['tracks']['items'] = all_track_items
                     playlist_data['tracks']['next'] = None # All items fetched
@@ -2238,7 +2388,7 @@ class SpotifyAPI:
 
         # Fetch albums for the artist
         artist_albums_api_url = f"https://api.spotify.com/v1/artists/{artist_id}/albums"
-        album_params = {'include_groups': 'album,single', 'limit': 50}
+        album_params = {'include_groups': 'album,single'}
         if self.user_market:
             album_params['market'] = self.user_market
         
@@ -2353,7 +2503,7 @@ class SpotifyAPI:
                 # Now get all episodes for the show using separate endpoint
                 episodes_list = []
                 episodes_api_url = f"https://api.spotify.com/v1/shows/{show_id}/episodes"
-                episodes_params = {'limit': 50}  # Maximum limit per request
+                episodes_params = {}  # Maximum limit per request
                 if self.user_market:
                     episodes_params['market'] = self.user_market
                 

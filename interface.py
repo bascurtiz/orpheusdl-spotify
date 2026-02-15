@@ -473,8 +473,10 @@ class ModuleInterface:
                                     self.logger.debug(f"[Spotify Preview] Track '{track_name}' - no API preview, will lazy-load")
 
                         if item_type == 'playlist':
-                            tracks_total = (item_dict.get('tracks') or {}).get('total') if isinstance(item_dict.get('tracks'), dict) else None
-                            if tracks_total is None or tracks_total == 0:
+                            tracks_total = (item_dict.get('tracks') or {}).get('total')
+                            # Relaxed check: Only skip if we are certain it has 0 tracks. 
+                            # If total is None (api didn't return it), we should still show the playlist.
+                            if tracks_total is not None and tracks_total == 0:
                                 continue
 
                         processed_results.append(SearchResult(**kwargs_for_sr))
