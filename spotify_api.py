@@ -1961,8 +1961,8 @@ class SpotifyAPI:
             self.logger.error(f"Unexpected error in get_track_info for track_id {track_id}: {e}. Attempting Librespot fallback from exception.")
             return self.get_track_via_librespot(track_id)
 
-    def get_album_info(self, album_id: str, metadata: Optional['AlbumInfo'] = None, _retry_attempted: bool = False) -> Optional[dict]:
-        self.logger.info(f"SpotifyAPI: Attempting to get album info for ID: {album_id}{' (retry)' if _retry_attempted else ''}")
+    def get_album_info(self, album_id: str, metadata: Optional['AlbumInfo'] = None, _retry_attempted: bool = False, _retry_count: int = 0) -> Optional[dict]:
+        self.logger.info(f"SpotifyAPI: Attempting to get album info for ID: {album_id}{' (retry)' if _retry_attempted else ''}{f' (429 retry {_retry_count})' if _retry_count else ''}")
 
         # Get Web API token (uses custom credentials if available, otherwise librespot token)
         web_api_token = self._get_web_api_token()
@@ -2034,6 +2034,10 @@ class SpotifyAPI:
             elif response.status_code == 404:
                 self.logger.warning(f"SpotifyAPI.get_album_info: Album {album_id} not found (404).")
                 raise SpotifyItemNotFoundError(f"Album with ID {album_id} not found.")
+            elif response.status_code == 429:
+                retry_after = int(response.headers.get('Retry-After', 5))
+                self.logger.warning(f"SpotifyAPI.get_album_info: Rate limited (429) for {album_id}. Retry-After: {retry_after}s")
+                raise SpotifyRateLimitDetectedError(f"Spotify rate limit (429) for album {album_id}. Retry-After: {retry_after}s")
             else:
                 self.logger.error(f"SpotifyAPI.get_album_info: Failed to get album data for {album_id}. Status: {response.status_code}, Response: {response.text}")
                 raise SpotifyApiError(f"Failed to get album data for {album_id}. Status: {response.status_code}, Response Text: {response.text[:200]}")
@@ -2477,8 +2481,8 @@ class SpotifyAPI:
         except requests.exceptions.RequestException as req_err:
             raise SpotifyApiError(f"get_several_artists request error: {req_err}") from req_err
 
-    def get_artist_info(self, artist_id: str, metadata: Optional['ArtistInfo'] = None, _retry_attempted: bool = False) -> Optional['ArtistInfo']:
-        self.logger.info(f"SpotifyAPI: Attempting to get artist info for ID: {artist_id}{' (retry)' if _retry_attempted else ''}")
+    def get_artist_info(self, artist_id: str, metadata: Optional['ArtistInfo'] = None, _retry_attempted: bool = False, _retry_count: int = 0) -> Optional['ArtistInfo']:
+        self.logger.info(f"SpotifyAPI: Attempting to get artist info for ID: {artist_id}{' (retry)' if _retry_attempted else ''}{f' (429 retry {_retry_count})' if _retry_count else ''}")
 
         # Get Web API token (uses custom credentials if available, otherwise librespot token)
         web_api_token = self._get_web_api_token()
@@ -2522,6 +2526,10 @@ class SpotifyAPI:
             elif http_err.response.status_code == 404:
                 self.logger.warning(f"SpotifyAPI.get_artist_info: Artist {artist_id} not found (404).")
                 raise SpotifyItemNotFoundError(f"Artist with ID {artist_id} not found.") from http_err
+            elif http_err.response.status_code == 429:
+                retry_after = int(http_err.response.headers.get('Retry-After', 5))
+                self.logger.warning(f"SpotifyAPI.get_artist_info: Rate limited (429) for {artist_id}. Retry-After: {retry_after}s")
+                raise SpotifyRateLimitDetectedError(f"Spotify rate limit (429) for artist {artist_id}. Retry-After: {retry_after}s") from http_err
             else:
                 self.logger.error(f"SpotifyAPI.get_artist_info: HTTP error fetching basic artist data for {artist_id}: {http_err.response.status_code} - {http_err.response.text[:200]}", exc_info=False)
                 raise SpotifyApiError(f"Failed to get basic artist data for {artist_id}. Status: {http_err.response.status_code}, Text: {http_err.response.text[:200]}") from http_err
@@ -2570,6 +2578,10 @@ class SpotifyAPI:
                     else:
                         self.logger.error("SpotifyAPI.get_artist_info (albums pagination): Re-auth failed.")
                         raise SpotifyAuthError(f"Re-authentication failed for artist {artist_id} albums pagination.")
+                elif paginated_response.status_code == 429:
+                    retry_after = int(paginated_response.headers.get('Retry-After', 5))
+                    self.logger.warning(f"SpotifyAPI.get_artist_info (albums pagination): Rate limited (429). Retry-After: {retry_after}s")
+                    raise SpotifyRateLimitDetectedError(f"Spotify rate limit (429) during artist albums pagination. Retry-After: {retry_after}s")
                 else:
                     paginated_response.raise_for_status() # Raise HTTPError for other bad statuses on album fetch
                     # Should not be reached if raise_for_status() works, but as a fallback:
@@ -2721,6 +2733,10 @@ class SpotifyAPI:
             elif response.status_code == 404:
                 self.logger.warning(f"SpotifyAPI.get_show_info: Show {show_id} not found (404).")
                 raise SpotifyItemNotFoundError(f"Show with ID {show_id} not found.")
+            elif response.status_code == 429:
+                retry_after = int(response.headers.get('Retry-After', 5))
+                self.logger.warning(f"SpotifyAPI.get_show_info: Rate limited (429) for {show_id}. Retry-After: {retry_after}s")
+                raise SpotifyRateLimitDetectedError(f"Spotify rate limit (429) for show {show_id}. Retry-After: {retry_after}s")
             else:
                 self.logger.error(f"SpotifyAPI.get_show_info: Failed to get show data for {show_id}. Status: {response.status_code}, Response: {response.text}")
                 raise SpotifyApiError(f"Failed to get show data for {show_id}. Status: {response.status_code}, Response Text: {response.text[:200]}")

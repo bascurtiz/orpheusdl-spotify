@@ -599,6 +599,9 @@ class ModuleInterface:
                 except Exception as show_error:
                     self.logger.error(f"Error processing show {actual_album_id_str}: {show_error}")
                     return None
+            except SpotifyRateLimitDetectedError:
+                # Rate limit must propagate to GUI for popup, never swallow
+                raise
             except Exception as album_error:
                 # If album processing fails, try show as fallback
                 try:
@@ -683,6 +686,9 @@ class ModuleInterface:
         try:
             return self.spotify_api.get_artist_info(artist_id, metadata=metadata)
         except SpotifyConfigError:
+            raise
+        except SpotifyRateLimitDetectedError:
+            # Rate limit must propagate to GUI for popup, never swallow
             raise
         except SpotifyApiError as e:
             self.module_error(f"Failed to get artist info for {artist_id}: {e}")
