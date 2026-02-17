@@ -326,9 +326,9 @@ class ModuleInterface:
         pass
 
     def search(self, query_type: DownloadTypeEnum, query: str, track_info: Optional[TrackInfo] = None, limit: Optional[int] = None) -> List[SearchResult]:
-        self.logger.info(f"Searching for {query_type.name}: {query}{f', with limit: {limit}' if limit else ''}")
-        if not self._ensure_authenticated(f"search for {query_type.name} '{query}'"):
-            return []
+        query_type_str = query_type.name if hasattr(query_type, 'name') else str(query_type)
+        self.logger.info(f"Searching for {query_type_str}: {query}{f', with limit: {limit}' if limit else ''}")
+
 
         try:
             # Pass the limit to the spotify_api.search method            
@@ -393,10 +393,9 @@ class ModuleInterface:
                             for artist in artists_data:
                                 if isinstance(artist, dict) and artist.get('genres'):
                                     genres.extend(artist['genres'])
-                        elif item_type == 'album':
                             # For albums, show track count in additional; optionally genres
                             total_tracks = item_dict.get('total_tracks')
-                            if total_tracks is not None:
+                            if total_tracks and total_tracks > 0:
                                 kwargs_for_sr['additional'] = [f"1 track" if total_tracks == 1 else f"{total_tracks} tracks"]
                             if item_dict.get('genres') and isinstance(item_dict['genres'], list):
                                 genres.extend(item_dict['genres'])
@@ -405,11 +404,16 @@ class ModuleInterface:
                             pass
                         elif item_type == 'playlist':
                             # Playlist track count in additional
+                            total_tracks = item_dict.get('total_tracks')
                             tracks_obj = item_dict.get('tracks', {})
-                            if isinstance(tracks_obj, dict):
+                            tracks_total = None
+                            if total_tracks is not None:
+                                tracks_total = total_tracks
+                            elif isinstance(tracks_obj, dict):
                                 tracks_total = tracks_obj.get('total')
-                                if tracks_total is not None:
-                                    kwargs_for_sr['additional'] = [f"1 track" if tracks_total == 1 else f"{tracks_total} tracks"]
+                                
+                            if tracks_total is not None and tracks_total > 0:
+                                kwargs_for_sr['additional'] = [f"1 track" if tracks_total == 1 else f"{tracks_total} tracks"]
                         
                         # Remove duplicates and populate additional field (for albums/playlists we already set "X tracks", don't overwrite)
                         if genres and item_type != 'playlist' and not (item_type == 'album' and kwargs_for_sr.get('additional')):
@@ -432,7 +436,7 @@ class ModuleInterface:
                                     pass
                         elif item_dict.get('release_date'):
                             # For albums, artists, or other items with direct release_date
-                            release_date = item_dict['release_date']
+                            release_date = str(item_dict['release_date'])
                             if release_date and len(release_date) >= 4:
                                 try:
                                     year_value = release_date[:4]  # Extract year from YYYY-MM-DD format
@@ -496,6 +500,10 @@ class ModuleInterface:
             else:
                 self.logger.info(f"Processed {len(processed_results)} SearchResult objects.")
             return processed_results
+        except SpotifyRateLimitDetectedError:
+            self.logger.warning("Search failed: Rate limit detected.")
+            self.printer.oprint("Search failed: Spotify rate limit detected. Please try again later.")
+            return []
         except SpotifyAuthError:
             self.logger.error("Search failed: Not authenticated. This should have been caught by _ensure_authenticated.")
             # This case should ideally not be reached if _ensure_authenticated works correctly
@@ -561,9 +569,7 @@ class ModuleInterface:
             return None
 
         try:
-            if not self._ensure_authenticated(context_message=f"get album info for ID {actual_album_id_str}"):
-                self.logger.error(f"Authentication failed for get_album_info with ID: {actual_album_id_str}")
-                return None
+
 
             # First try to get as album
             try:
@@ -634,8 +640,7 @@ class ModuleInterface:
 
     def get_playlist_info(self, playlist_id: str, metadata: Optional[PlaylistInfo] = None) -> Optional[PlaylistInfo]:
         self.logger.info(f"Getting playlist info for ID: {playlist_id} (called from interface)")
-        if not self._ensure_authenticated(f"get playlist info for ID {playlist_id}"):
-            return None
+
 
         try:
             # spotify_api.get_playlist_info returns a dictionary
@@ -680,8 +685,7 @@ class ModuleInterface:
         
     def get_artist_info(self, artist_id: str, metadata: Optional[ArtistInfo] = None, **kwargs) -> Optional[ArtistInfo]:
         # Ensure authentication before proceeding
-        if not self._ensure_authenticated(context_message="get_artist_info"):
-            return None
+
 
         try:
             return self.spotify_api.get_artist_info(artist_id, metadata=metadata)
@@ -696,33 +700,26 @@ class ModuleInterface:
 
     def get_track_cover(self, track_id: str, cover_options: CoverOptions, data=None) -> Optional[CoverInfo]:
         """Fetches the cover information for a given track ID."""
-        if not self._ensure_authenticated(context_message="get_track_cover"):
-            self.printer.oprint("Authentication required to fetch track cover.", drop_level=1)
-            return None
-
         try:
-            # Use the existing get_track_by_id method which should return metadata including the cover
-            track_data = self.spotify_api.get_track_by_id(track_id)
-            if not track_data:
-                self.printer.oprint(f"Could not retrieve metadata for track_id: {track_id}", drop_level=1)
-            return None
-
-            # Extract cover URL from the track data
-            # Based on spotify_api.py, the URL should be in track_data['album']['images'][0]['url']
-            if track_data.get('album') and track_data['album'].get('images'):
-                cover_url = track_data['album']['images'][0]['url']
-                return CoverInfo(
-                    url=cover_url,
-                    # Assuming JPEG, but the API might provide this. For now, this is a safe bet.
-                    file_type=ImageFileTypeEnum.jpg
-                )
-            else:
-                self.printer.oprint(f"No cover art found for track_id: {track_id}", drop_level=1)
-                return None
-
-        except SpotifyItemNotFoundError:
-            self.printer.oprint(f"Track with ID '{track_id}' not found.", drop_level=1)
-            return None
+             # Use Embed Client directly for cover Art (no auth required)
+             metadata = self.spotify_api.embed_client.get_track_metadata(track_id)
+             track = metadata.get('trackUnion') if metadata else None
+             
+             cover_url = None
+             if track:
+                 cover_sources = track.get('albumOfTrack', {}).get('coverArt', {}).get('sources', [])
+                 if cover_sources:
+                     cover_url = cover_sources[0].get('url')
+             
+             if cover_url:
+                 return CoverInfo(
+                     url=cover_url, 
+                     file_type=ImageFileTypeEnum.jpg
+                 )
+             
+             self.printer.oprint(f"No cover art found for track_id: {track_id}", drop_level=1)
+             return None
+             
         except SpotifyApiError as e:
             self.module_error(f"An API error occurred while fetching the track cover for {track_id}: {e}")
             return None
