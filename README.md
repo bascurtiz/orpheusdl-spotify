@@ -46,13 +46,11 @@ When enabling the Spotify module in OrpheusDL (e.g., via `config/settings.json` 
 *   **`download_pause_seconds`:** A 30 seconds pause in between downloads is recommended, see: [here](https://developer.spotify.com/documentation/web-api/concepts/rate-limits) and [here](https://github.com/zotify-dev/zotify/issues/186#issuecomment-2608381052)
 *   **`clientID`:** Enter your Spotify client ID here.
 *   **`clientSecret`:** Enter your Spotify client secret here.
-* When clicking `Create App`, currently you get a message `New integrations are currently on hold while we make updates to improve reliability and performance.`
-If this is the case, and you didn't create an app yet, you can't use a borrowed Client ID and Client Secret, since those are tight to your account.
 
 ## Authentication
 
 This module primarily uses a unified OAuth 2.0 PKCE (Proof Key for Code Exchange) flow for both:
-*   **Web API Access:** For searching, retrieving metadata (track, album, playlist, artist info).
+*   **GraphQL / Embed API Access:** For searching, retrieving metadata (track, album, playlist, artist info).
 *   **Stream API Access:** For accessing audio streams for downloads via the integrated Librespot functionality.
 
 **Process:**
