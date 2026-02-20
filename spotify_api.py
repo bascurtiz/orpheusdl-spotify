@@ -1669,12 +1669,21 @@ class SpotifyAPI:
                 if not data: return []
                 return data.get('items', [])
             
-            first_artists = get_artists(track_union.get('firstArtist'))
-            other_artists = get_artists(track_union.get('otherArtists'))
-            all_artists = first_artists + other_artists
+            # Correctly handle artist names in the current GraphQL structure
+            artist_items = get_artists(track_union.get('artists'))
+            if not artist_items:
+                 artist_items = get_artists(track_union.get('firstArtist')) + get_artists(track_union.get('otherArtists'))
             
-            artist_names = [a.get('profile', {}).get('name') for a in all_artists if a.get('profile', {}).get('name')]
-            artist_ids = [a.get('id') for a in all_artists if a.get('id')]
+            artist_names = []
+            artist_ids = []
+            for a in artist_items:
+                profile = a.get('profile', {})
+                name_val = profile.get('name') or a.get('name')
+                if name_val:
+                    artist_names.append(name_val)
+                a_id = a.get('id')
+                if a_id:
+                    artist_ids.append(a_id)
             
             album_data = track_union.get('albumOfTrack', {})
             album_name = album_data.get('name')
@@ -1818,8 +1827,9 @@ class SpotifyAPI:
                 
                 # Transform to Web API format expected by interface
                 track_artists = []
-                # Combine firstArtist, otherArtists, featuredArtists
-                t_artists_raw = get_items(track.get('firstArtist')) + get_items(track.get('otherArtists')) + get_items(track.get('featuredArtists'))
+                # Combine artists.items or firstArtist, otherArtists, featuredArtists
+                t_artists_raw = get_items(track.get('artists')) or \
+                               (get_items(track.get('firstArtist')) + get_items(track.get('otherArtists')) + get_items(track.get('featuredArtists')))
                 
                 seen_ids = set()
                 for a in t_artists_raw:
