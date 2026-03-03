@@ -512,7 +512,10 @@ class ModuleInterface:
             return []
         except SpotifyApiError as e:
             self.logger.error(f"API error during Spotify search: {e}", exc_info=True)
-            self.printer.oprint(f"Spotify search failed due to an API issue: {e}")
+            if self.debug_mode:
+                self.printer.oprint(f"Spotify search failed due to an API issue: {e}")
+            else:
+                self.printer.oprint("Spotify search failed or was incomplete due to a temporary service issue.")
             return []
         except Exception as e:
             self.logger.error(f"Unexpected error during Spotify search: {e}", exc_info=True)

@@ -1258,7 +1258,11 @@ class SpotifyAPI:
 
             except Exception as e:
                 self.logger.error(f"SpotifyAPI.search: Error during embed search for '{query_str}': {e}", exc_info=True)
-                # Fallback or re-raise? For now, re-raise as ApiError
+                # If we already have some items, return them instead of failing completely
+                if all_items:
+                    self.logger.warning(f"SpotifyAPI.search: Returning partial results ({len(all_items)}) due to error: {e}")
+                    return all_items
+                # Otherwise, raise as ApiError
                 raise SpotifyApiError(f"Error during embed search: {e}")
         
         self.logger.info(f"SpotifyAPI.search: Successfully retrieved {len(all_items)} items for '{query_str}' via Embed API")
