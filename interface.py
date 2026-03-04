@@ -875,9 +875,49 @@ class ModuleInterface:
             self.logger.error(f"SpotifyAuthError in get_track_download: {e}", exc_info=self.debug_mode)
             return None
         except SpotifyApiError as e:
-            self.printer.oprint(f"Spotify API error during track download: {e}", drop_level=0)
-            self.logger.error(f"SpotifyApiError in get_track_download: {e}", exc_info=self.debug_mode)
-            return None
+            error_str = str(e)
+            # Detect 401 (token expired) and attempt automatic re-authentication
+            if '401' in error_str:
+                self.logger.warning(f"Token expired (401) detected during track download. Attempting re-authentication...")
+                self.printer.oprint("Spotify token expired. Re-authenticating...", drop_level=0)
+                
+                reauth_success = False
+                try:
+                    # Step 1: Try refreshing token from stored credentials (no browser needed)
+                    if self.spotify_api._load_existing_credentials() and self.spotify_api.stored_token:
+                        if self.spotify_api._create_librespot_session_from_oauth():
+                            self.logged_in = True
+                            reauth_success = True
+                            self.logger.info("Re-authentication via token refresh succeeded.")
+                    
+                    # Step 2: If refresh failed, do full OAuth flow (opens browser)
+                    if not reauth_success:
+                        self.printer.oprint("Token refresh failed. Opening browser for Spotify re-authorization...", drop_level=0)
+                        if self.spotify_api._perform_oauth_flow():
+                            if self.spotify_api._create_librespot_session_from_oauth():
+                                self.logged_in = True
+                                reauth_success = True
+                                self.logger.info("Re-authentication via full OAuth flow succeeded.")
+                
+                except Exception as reauth_err:
+                    self.logger.error(f"Re-authentication attempt failed: {reauth_err}", exc_info=True)
+                
+                # Retry the download once after successful re-auth
+                if reauth_success:
+                    try:
+                        self.printer.oprint("Retrying download after re-authentication...", drop_level=0)
+                        return self.spotify_api.get_track_download(**kwargs)
+                    except Exception as retry_err:
+                        self.printer.oprint(f"Download still failed after re-authentication: {retry_err}", drop_level=0)
+                        self.logger.error(f"Retry after reauth failed: {retry_err}", exc_info=self.debug_mode)
+                        return None
+                else:
+                    self.printer.oprint(f"Re-authentication failed. Spotify API error: {e}", drop_level=0)
+                    return None
+            else:
+                self.printer.oprint(f"Spotify API error during track download: {e}", drop_level=0)
+                self.logger.error(f"SpotifyApiError in get_track_download: {e}", exc_info=self.debug_mode)
+                return None
         except Exception as e:
             self.printer.oprint(f"An unexpected error occurred during Spotify track download: {e}", drop_level=0)
             self.logger.error(f"Unexpected exception in ModuleInterface.get_track_download: {e}", exc_info=True)
