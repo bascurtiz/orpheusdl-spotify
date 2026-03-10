@@ -3,7 +3,8 @@ import logging
 import os
 import sys
 import time
-from typing import List, Optional, Tuple
+import concurrent.futures
+from typing import Optional, List, Tuple
 from enum import Enum
 from traceback import print_exc
 
@@ -384,21 +385,24 @@ class ModuleInterface:
                         # Extract genres from different sources based on item type
                         genres = []
                         if item_type == 'track':
-                            # For tracks, genres are usually in the album or artist data
+                            # For tracks, show album name in additional column and extract genres
                             album_data = item_dict.get('album', {})
-                            if isinstance(album_data, dict) and album_data.get('genres'):
-                                genres.extend(album_data['genres'])
+                            if isinstance(album_data, dict):
+                                album_name = album_data.get('name')
+                                if album_name:
+                                    kwargs_for_sr['additional'] = [album_name]
+                                if album_data.get('genres'):
+                                    genres.extend(album_data['genres'])
                             # Also check artist genres if available (less common in search results)
                             artists_data = item_dict.get('artists', [])
                             for artist in artists_data:
                                 if isinstance(artist, dict) and artist.get('genres'):
                                     genres.extend(artist['genres'])
-                            # For albums, show track count in additional; optionally genres
+                        elif item_type == 'album':
+                            # For albums, show track count in additional
                             total_tracks = item_dict.get('total_tracks')
                             if total_tracks and total_tracks > 0:
                                 kwargs_for_sr['additional'] = [f"1 track" if total_tracks == 1 else f"{total_tracks} tracks"]
-                            if item_dict.get('genres') and isinstance(item_dict['genres'], list):
-                                genres.extend(item_dict['genres'])
                         elif item_type == 'artist':
                             # Do not show genres in Additional for artist search (intentionally left blank)
                             pass
@@ -416,9 +420,13 @@ class ModuleInterface:
                                 kwargs_for_sr['additional'] = [f"1 track" if tracks_total == 1 else f"{tracks_total} tracks"]
                         
                         # Remove duplicates and populate additional field (for albums/playlists we already set "X tracks", don't overwrite)
-                        if genres and item_type != 'playlist' and not (item_type == 'album' and kwargs_for_sr.get('additional')):
+                        if genres:
                             unique_genres = list(dict.fromkeys(genres))  # Preserve order while removing duplicates
-                            kwargs_for_sr['additional'] = unique_genres[:3]  # Limit to first 3 genres to avoid UI clutter
+                            # If it's a playlist or album, keep the existing 'X tracks' at the start and append genres
+                            if kwargs_for_sr.get('additional'):
+                                kwargs_for_sr['additional'].extend(unique_genres[:3])
+                            else:
+                                kwargs_for_sr['additional'] = unique_genres[:3]
 
                         # Extract duration from duration_ms (convert from milliseconds to seconds)
                         duration_ms = item_dict.get('duration_ms')
@@ -483,6 +491,7 @@ class ModuleInterface:
                             if tracks_total is not None and tracks_total == 0:
                                 continue
 
+                        kwargs_for_sr['extra_kwargs'] = {'raw_result': item_dict}
                         processed_results.append(SearchResult(**kwargs_for_sr))
                     except Exception as e_create_sr:
                         self.logger.error(f"Error creating SearchResult for item: {item_dict.get('name')}. Error: {e_create_sr}", exc_info=True)                        
@@ -491,14 +500,159 @@ class ModuleInterface:
 
             # Log summary for track searches
             if processed_results and raw_results and raw_results[0].get('type') == 'track':
+                # Batch fetch missing years using Embed API
+                missing_year_tracks = [r for r in processed_results if not r.year]
+                if missing_year_tracks:
+                    album_ids = [str(r.extra_kwargs.get('raw_result', {}).get('album', {}).get('id', '')) for r in missing_year_tracks if r.extra_kwargs.get('raw_result', {}).get('album', {}).get('id')]
+                    album_ids = list(set(aid for aid in album_ids if aid))
+                    album_dates = {}
+                    
+                    def _fetch_spotify_album_date(aid):
+                        try:
+                            a_data = self.spotify_api.embed_client.get_album_metadata(aid)
+                            release_date = a_data.get('albumUnion', {}).get('date', {}).get('isoString')
+                            if release_date: return aid, str(release_date).split('-')[0]
+                        except: pass
+                        return aid, None
+
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                        for aid, y in executor.map(_fetch_spotify_album_date, album_ids):
+                            if y: album_dates[aid] = y
+                    
+                    for r in missing_year_tracks:
+                        aid = str(r.extra_kwargs.get('raw_result', {}).get('album', {}).get('id', ''))
+                        if not r.year and aid in album_dates:
+                            r.year = album_dates[aid]
+
                 tracks_with_api_preview = sum(1 for r in processed_results if getattr(r, 'preview_url', None))
                 total_tracks = len(processed_results)
                 if tracks_with_api_preview > 0:
                     self.logger.info(f"Processed {total_tracks} track results. API previews: {tracks_with_api_preview}/{total_tracks} (others will lazy-load)")
                 else:
                     self.logger.info(f"Processed {total_tracks} track results. Previews will be lazy-loaded from embed page when clicked.")
+            elif processed_results and raw_results and raw_results[0].get('type') == 'album':
+                # Batch fetch missing metadata (primarily duration) for albums using Embed API
+                missing_meta_albums = [r for r in processed_results if not r.duration or not r.year or not r.additional]
+                if missing_meta_albums:
+                    album_ids = [r.result_id for r in missing_meta_albums]
+                    album_meta = {}
+                    
+                    def _fetch_spotify_album_meta(aid):
+                        year = None
+                        track_count = None
+                        duration = None
+                        try:
+                            a_data = self.spotify_api.embed_client.get_album_metadata(aid)
+                            album_union = a_data.get('albumUnion', {})
+                            
+                            # Year
+                            release_date = album_union.get('date', {}).get('isoString')
+                            if release_date:
+                                year = str(release_date).split('-')[0]
+                            
+                            # Track count
+                            tracks_v2 = album_union.get('tracksV2', {})
+                            track_count = tracks_v2.get('totalCount')
+                            
+                            # Duration
+                            items = tracks_v2.get('items', [])
+                            sum_dur = 0
+                            for item in items:
+                                if not isinstance(item, dict): continue
+                                track_data = item.get('track') or item.get('item', {}).get('data')
+                                if isinstance(track_data, dict):
+                                    dur_ms = track_data.get('duration', {}).get('totalMilliseconds')
+                                    if dur_ms: sum_dur += dur_ms
+                            
+                            if sum_dur > 0:
+                                duration = sum_dur // 1000
+                                
+                            # Explicit tag
+                            explicit = album_union.get('contentRating', {}).get('label') == 'EXPLICIT'
+                            if not explicit:
+                                # Fallback: check if any track is explicit
+                                for item in items:
+                                    if not isinstance(item, dict): continue
+                                    t_data = item.get('track') or item.get('item', {}).get('data')
+                                    if isinstance(t_data, dict) and t_data.get('contentRating', {}).get('label') == 'EXPLICIT':
+                                        explicit = True
+                                        break
+                        except: pass
+                        return aid, year, track_count, duration, explicit
+
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                        for aid, y, tc, dur, exp in executor.map(_fetch_spotify_album_meta, album_ids):
+                            album_meta[aid] = {'year': y, 'track_count': tc, 'duration': dur, 'explicit': exp}
+                    
+                    for r in missing_meta_albums:
+                        if r.result_id in album_meta:
+                            meta = album_meta[r.result_id]
+                            if not r.year and meta['year']:
+                                r.year = meta['year']
+                            if not r.additional and meta['track_count']:
+                                r.additional = [f"1 track" if meta['track_count'] == 1 else f"{meta['track_count']} tracks"]
+                            if not r.duration and meta['duration']:
+                                r.duration = meta['duration']
+                            if r.explicit is False and meta.get('explicit'):
+                                r.explicit = True
+                self.logger.info(f"Processed {len(processed_results)} SearchResult objects.")
+            elif processed_results and raw_results and raw_results[0].get('type') == 'playlist':
+                # Batch fetch missing years and missing track counts for playlists using Embed API
+                missing_meta_playlists = [r for r in processed_results if not r.year or not r.additional or not r.duration]
+                if missing_meta_playlists:
+                    playlist_ids = [r.result_id for r in missing_meta_playlists]
+                    playlist_meta = {}
+                    
+                    def _fetch_spotify_playlist_meta(pid):
+                        year = None
+                        track_count = None
+                        duration = None
+                        try:
+                            p_data = self.spotify_api.embed_client.get_playlist_metadata(pid)
+                            items = p_data.get('playlistV2', {}).get('content', {}).get('items', [])
+                            if items:
+                                dates = [item.get('addedAt', {}).get('isoString') for item in items if getattr(item, 'get', None) and item.get('addedAt', {}).get('isoString')]
+                                if dates:
+                                    earliest = min(dates)
+                                    year = str(earliest).split('-')[0]
+                                    
+                                durations = [item.get('itemV2', {}).get('data', {}).get('trackDuration', {}).get('totalMilliseconds') for item in items if getattr(item, 'get', None)]
+                                sum_dur = sum(d for d in durations if d)
+                                if sum_dur > 0:
+                                    duration = sum_dur // 1000
+                                    
+                            tracks_total = p_data.get('playlistV2', {}).get('content', {}).get('totalCount')
+                            if not tracks_total and items:
+                                tracks_total = len(items)
+                            if tracks_total:
+                                track_count = tracks_total
+                        except: pass
+                        return pid, year, track_count, duration
+
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                        for pid, y, tc, dur in executor.map(_fetch_spotify_playlist_meta, playlist_ids):
+                            playlist_meta[pid] = {'year': y, 'track_count': tc, 'duration': dur}
+                    
+                    for r in missing_meta_playlists:
+                        if r.result_id in playlist_meta:
+                            meta = playlist_meta[r.result_id]
+                            if not r.year and meta['year']:
+                                r.year = meta['year']
+                            if not r.additional and meta['track_count']:
+                                r.additional = [f"1 track" if meta['track_count'] == 1 else f"{meta['track_count']} tracks"]
+                            if not r.duration and meta['duration']:
+                                r.duration = meta['duration']
+                self.logger.info(f"Processed {len(processed_results)} SearchResult objects.")
             else:
                 self.logger.info(f"Processed {len(processed_results)} SearchResult objects.")
+            # Final filtering for playlists: Remove any that have no tracks
+            if query_type == DownloadTypeEnum.playlist:
+                def _has_tracks(item):
+                    if not item.additional: return False
+                    return any("track" in str(s) for s in item.additional)
+                
+                processed_results = [t for t in processed_results if _has_tracks(t)]
+
             return processed_results
         except SpotifyRateLimitDetectedError:
             self.logger.warning("Search failed: Rate limit detected.")

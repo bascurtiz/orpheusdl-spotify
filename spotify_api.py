@@ -1191,6 +1191,7 @@ class SpotifyAPI:
                             'images': images,
                             'release_date': item_data.get('date', {}).get('year'), # Approximate
                             'total_tracks': item_data.get('tracks', {}).get('totalCount') or item_data.get('tracks', {}).get('total') or 0,
+                            'explicit': item_data.get('contentRating', {}).get('label') == 'EXPLICIT',
                             'external_urls': {'spotify': f"https://open.spotify.com/album/{item_data.get('uri', '').split(':')[-1]}"}
                         }
                         items.append(album_obj)
@@ -2366,21 +2367,80 @@ class SpotifyAPI:
                          try: release_year = int(date_obj['isoString'][:4])
                          except: pass
                     
+                    total_tracks = album.get('tracks', {}).get('totalCount')
+                    additional = [f"1 track" if total_tracks == 1 else f"{total_tracks} tracks"] if total_tracks is not None else None
+
                     simplified_albums.append({
                         'id': album.get('id'), # Note: might need to strip spotify:album: prefix if present? usually just ID in GraphQL
                         'name': album.get('name'),
                         'album_type': album.get('type', 'album').lower(), # 'SINGLE', 'ALBUM', etc
                         'release_year': release_year,
                         'cover_url': cover_url,
-                        'total_tracks': album.get('tracks', {}).get('totalCount')
+                        'total_tracks': total_tracks,
+                        'additional': additional,
+                        'explicit': None
                     })
             
+            # Batch fetch missing durations for albums
+            albums_to_fetch = [idx for idx, t in enumerate(simplified_albums) if not t.get('duration')]
+            if albums_to_fetch:
+                a_meta = {}
+                def _fetch_spotify_album_duration(aid):
+                    try:
+                        actual_id = aid.split(':')[-1] if ':' in aid else aid
+                        album_meta = self.embed_client.get_album_metadata(actual_id)
+                        album_union = album_meta.get('albumUnion') if album_meta else None
+                        if album_union:
+                            # The structure for tracks in albumUnion is albumUnion.tracksV2.items
+                            tracks_obj = album_union.get('tracksV2') or album_union.get('tracks', {})
+                            tracks = tracks_obj.get('items', [])
+                            nb_tracks = tracks_obj.get('totalCount') or len(tracks)
+                            sum_dur = 0
+                            for t in tracks:
+                                if not isinstance(t, dict): continue
+                                # Item might be { track: { ... } } or { ... }
+                                track_data = t.get('track') if t.get('track') else t
+                                if isinstance(track_data, dict):
+                                    d = track_data.get('duration', {})
+                                    if isinstance(d, dict):
+                                        sum_dur += d.get('totalMilliseconds', 0) or 0
+                            
+                            # Explicit check
+                            explicit = album_union.get('contentRating', {}).get('label') == 'EXPLICIT'
+                            if not explicit:
+                                for t in tracks:
+                                    if not isinstance(t, dict): continue
+                                    tr_data = t.get('track') or t
+                                    if isinstance(tr_data, dict) and tr_data.get('contentRating', {}).get('label') == 'EXPLICIT':
+                                        explicit = True
+                                        break
+                                        
+                            return aid, (sum_dur // 1000 if sum_dur > 0 else None, nb_tracks, explicit)
+                    except: pass
+                    return aid, (None, None)
+
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                    fetch_ids = [simplified_albums[idx]['id'] for idx in albums_to_fetch]
+                    for aid, (dur, nb_tracks, explicit) in executor.map(_fetch_spotify_album_duration, fetch_ids):
+                        a_meta[aid] = (dur, nb_tracks, explicit)
+                
+                for idx in albums_to_fetch:
+                    t = simplified_albums[idx]
+                    aid = t['id']
+                    if aid in a_meta:
+                        dur, nb_tracks, explicit = a_meta[aid]
+                        if dur: t['duration'] = dur
+                        if nb_tracks and not t.get('total_tracks'):
+                            t['total_tracks'] = nb_tracks
+                            t['additional'] = [f"1 track" if nb_tracks == 1 else f"{nb_tracks} tracks"]
+                        if explicit: t['explicit'] = True
+
             try:
                 artist_info_obj = ArtistInfo(
                     name=artist_name,
                     albums=simplified_albums,
                 )
-                self.logger.info(f"SpotifyAPI.get_artist_info: Successfully created ArtistInfo object for {artist_name} ({artist_id}) with {len(simplified_albums)} albums.")
                 return artist_info_obj
             except Exception as e_create:
                  self.logger.error(f"Error creating ArtistInfo: {e_create}")
@@ -2391,124 +2451,6 @@ class SpotifyAPI:
         except Exception as e:
             self.logger.error(f"Unexpected error in get_artist_info for {artist_id}: {e}", exc_info=True)
             raise SpotifyApiError(f"An unexpected error occurred while fetching artist {artist_id}: {e}")
-
-    def get_playlist_info(self, playlist_id: str, metadata: Optional['PlaylistInfo'] = None, _retry_attempted: bool = False) -> Optional[dict]:
-        self.logger.info(f"SpotifyAPI: Attempting to get playlist info for ID: {playlist_id}")
-        
-        try:
-            # Use Embed Client to get metadata (no credentials required)
-            playlist_data_graphql = self.embed_client.get_playlist_metadata(playlist_id)
-            playlist_v2 = playlist_data_graphql.get("playlistV2") or playlist_data_graphql.get("playlist")
-            
-            if not playlist_v2:
-                raise SpotifyItemNotFoundError(f"Playlist with ID {playlist_id} not found.")
-                
-            name = playlist_v2.get('name')
-            description = playlist_v2.get('description')
-            
-            # Images
-            images = []
-            pl_images = playlist_v2.get('images', {}).get('items', [])
-            if pl_images:
-                 # Usually taking the first one's sources
-                 first_image = pl_images[0]
-                 for src in first_image.get('sources', []):
-                     images.append({
-                         'url': src.get('url'),
-                         'height': src.get('height'),
-                         'width': src.get('width')
-                     })
-            
-            # Parsing tracks
-            all_track_items = []
-            content = playlist_v2.get('content', {})
-            raw_items = content.get('items', [])
-            for item_wrapper in raw_items:
-                item_v2 = item_wrapper.get('itemV2', {})
-                data = item_v2.get('data', {})
-                
-                # Check if it's a track (or Episode, which we might skip or handle differently)
-                if data.get('__typename') == 'Track' or data.get('uri', '').startswith('spotify:track:'):
-                    track = data
-                    
-                    # Helper to safely extract list
-                    def get_items(d):
-                        if not d: return []
-                        return d.get('items', [])
-                    
-                    # Transform artists
-                    track_artists = []
-                    # Artists are usually under 'artists' -> 'items' in Track V2
-                    raw_artists = get_items(track.get('artists'))
-                    for a in raw_artists:
-                        profile = a.get('profile', {})
-                        name_val = profile.get('name') or a.get('name')
-                        if name_val:
-                            track_artists.append({
-                                'id': a.get('uri', '').split(':')[-1] if a.get('uri') else None,
-                                'name': name_val
-                            })
-                    
-                    duration_ms = track.get('trackDuration', {}).get('totalMilliseconds') or track.get('duration', {}).get('totalMilliseconds')
-                    explicit = track.get('contentRating', {}).get('label') == 'EXPLICIT'
-                    
-                    album = track.get('albumOfTrack', {})
-                    album_obj = {
-                        'id': album.get('uri', '').split(':')[-1] if album.get('uri') else None,
-                        'name': album.get('name'),
-                        'images': [],
-                        'release_date': album.get('date', {}).get('isoString')
-                    }
-                    if album_obj['release_date']: album_obj['release_date'] = album_obj['release_date'][:10]
-                    
-                    # Cover art for album
-                    cover_sources = album.get('coverArt', {}).get('sources', [])
-                    if cover_sources:
-                         album_obj['images'] = [{'url': s.get('url'), 'width': s.get('width'), 'height': s.get('height')} for s in cover_sources]
-                    
-                    all_track_items.append({
-                        'track': { # Wrap in 'track' key as Web API does for playlist items
-                            'id': track.get('uri', '').split(':')[-1] if track.get('uri') else None,
-                            'name': track.get('name'),
-                            'duration_ms': duration_ms,
-                            'track_number': track.get('trackNumber'),
-                            'disc_number': track.get('discNumber'),
-                            'explicit': explicit,
-                            'artists': track_artists,
-                            'album': album_obj,
-                            'type': 'track',
-                            'is_local': False
-                        },
-                        'added_at': item_wrapper.get('addedAt', {}).get('isoString')
-                    })
-            
-            owner_data = playlist_v2.get('ownerV2', {}).get('data', {})
-            owner = {
-                'display_name': owner_data.get('name'),
-                'id': owner_data.get('uri', '').split(':')[-1] if owner_data.get('uri') else None
-            }
-            
-            playlist_data = {
-                'id': playlist_id,
-                'name': name,
-                'description': description,
-                'images': images,
-                'owner': owner,
-                'tracks': {
-                    'items': all_track_items,
-                    'total': content.get('totalCount') or len(all_track_items)
-                },
-                'primary_color': None
-            }
-            
-            self.logger.info(f"SpotifyAPI.get_playlist_info: Successfully retrieved playlist data for {playlist_id}")
-            return playlist_data
-
-        except SpotifyItemNotFoundError:
-             raise
-        except Exception as e:
-            self.logger.error(f"Unexpected error in get_playlist_info for {playlist_id}: {e}", exc_info=True)
-            raise SpotifyApiError(f"An unexpected error occurred while fetching playlist {playlist_id}: {e}")
 
     def get_show_info(self, show_id: str, metadata: Optional['AlbumInfo'] = None, _retry_attempted: bool = False) -> Optional[dict]:
         """Get show information from Spotify API. Returns show data in album-like format for compatibility."""
