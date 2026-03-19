@@ -158,7 +158,7 @@ class ModuleInterface:
             'artist': {}
         }
 
-    def _ensure_authenticated(self, context_message: str) -> bool:
+    def _ensure_authenticated(self, context_message: str, silent: bool = False) -> bool:
         """Checks if authenticated and attempts login if not. Returns True if authenticated, False otherwise."""
         if self.debug_mode:
             self.logger.info(f"[{context_message}] Entry point for _ensure_authenticated.")
@@ -188,27 +188,9 @@ class ModuleInterface:
                         missing.append("client ID")
                     if not client_secret:
                         missing.append("client secret")
-                    if missing:
-                        error_msg = (
-                            "Spotify credentials are missing in settings.json. "
-                            f"Please fill in: {', '.join(missing)}. "
-                            "Use the OrpheusDL GUI Settings tab (Spotify) or edit config/settings.json directly."
-                        )
-                    else:
-                        # Credentials present but auth failed - likely expired tokens
-                        oauth_error = None
-                        if (self.spotify_api.librespot_oauth_handler and
-                            hasattr(self.spotify_api.librespot_oauth_handler, 'error_message') and
-                            self.spotify_api.librespot_oauth_handler.error_message):
-                            oauth_error = self.spotify_api.librespot_oauth_handler.error_message
-                        credentials_path = self.spotify_api.credentials_file_path
-                        if oauth_error:
-                            error_msg = f"Spotify authentication failed: {oauth_error}\n\n"
-                        else:
-                            error_msg = "Spotify authentication failed or session could not be refreshed.\nYour tokens may have expired.\n\n"
-                        error_msg += f"If this problem persists, try manually deleting the credentials file:\n{credentials_path}\n"
-                        error_msg += "Then run the command again to trigger a fresh authentication."
-                    self.printer.oprint(error_msg)
+                    if not silent:
+                        error_msg = "Spotify credentials are required for downloading. Please fill in your username, client ID and secret in the settings."
+                        self.printer.oprint(error_msg)
                     self.logged_in = False
                     if self.debug_mode:
                         self.logger.info(f"[{context_message}] _ensure_authenticated returning False (auth_attempt_result was False).")
@@ -230,7 +212,8 @@ class ModuleInterface:
                     return True
                 else:
                     self.logger.warning(f"[{context_message}] Session STILL NOT VALID after authenticate_stream_api reported success. Setting logged_in=False.")
-                    self.printer.oprint("Spotify authentication seemed to succeed but session remains invalid.")
+                    if not silent:
+                        self.printer.oprint("Spotify authentication seemed to succeed but session remains invalid.")
                     self.logged_in = False
                     if self.debug_mode:
                         self.logger.info(f"[{context_message}] _ensure_authenticated returning False (session invalid despite auth attempt success report).")
@@ -240,14 +223,16 @@ class ModuleInterface:
                 raise
             except SpotifyAuthError as e:
                 self.logger.error(f"[{context_message}] SpotifyAuthError caught during authenticate_stream_api (non-forced) call: {e}")
-                self.printer.oprint(f"Spotify authentication failed: {e}")
+                if not silent:
+                    self.printer.oprint(f"Spotify authentication failed: {e}")
                 self.logged_in = False
                 if self.debug_mode:
                     self.logger.info(f"[{context_message}] _ensure_authenticated returning False (SpotifyAuthError caught).")
                 return False
             except Exception as e_auth_unexpected: # Catch any other unexpected errors during the auth attempt
                 self.logger.error(f"[{context_message}] Unexpected exception during authenticate_stream_api (non-forced) call: {e_auth_unexpected}", exc_info=True)
-                self.printer.oprint(f"An unexpected error occurred during Spotify authentication: {e_auth_unexpected}")
+                if not silent:
+                    self.printer.oprint(f"An unexpected error occurred during Spotify authentication: {e_auth_unexpected}")
                 self.logged_in = False
                 if self.debug_mode:
                     self.logger.info(f"[{context_message}] _ensure_authenticated returning False (unexpected exception caught).")
@@ -680,10 +665,17 @@ class ModuleInterface:
         """Fetches track information and parses it into a TrackInfo object. Also handles episode IDs via fallback."""
         self.logger.info(f"Getting track info for ID: {track_id} (called from interface)")
         
+        # Check authentication first if we want to fail early for downloads.
+        # Use silent=True because we'll return the error in TrackInfo.error for the downloader to print.
+        auth_ok = self._ensure_authenticated("get_track_info", silent=True)
+        error_msg = "Spotify credentials are required for downloading. Please fill in your username, client ID and secret in the settings."
+
         try:
             # First, attempt to get track info from spotify_api
             track_info_result = self.spotify_api.get_track_info(track_id, quality_tier, codec_options, **extra_kwargs)
             if track_info_result:
+                if not auth_ok:
+                    track_info_result.error = error_msg
                 self.logger.info(f"Successfully retrieved TrackInfo for track ID: {track_id}, Name: {track_info_result.name}")
                 return track_info_result
             
@@ -691,6 +683,8 @@ class ModuleInterface:
             self.logger.info(f"Track info returned None for {track_id}, trying as episode...")
             episode_info_result = self.spotify_api.get_episode_info(track_id, quality_tier, codec_options, **extra_kwargs)
             if episode_info_result:
+                if not auth_ok:
+                    episode_info_result.error = error_msg
                 self.logger.info(f"Successfully fetched episode as TrackInfo object for ID: {track_id}")
                 return episode_info_result
             
@@ -699,7 +693,15 @@ class ModuleInterface:
             return None
             
         except SpotifyConfigError:
-            raise
+            # For downloads, return TrackInfo with error instead of raising to avoid redundant prefixes later
+            return TrackInfo(
+                id=track_id,
+                name="Unknown Track",
+                album="Unknown Album",
+                artists=["Unknown Artist"],
+                error=error_msg,
+                codec=CodecEnum.VORBIS
+            )
         except SpotifyItemNotFoundError:
             self.logger.warning(f"Track/Episode ID {track_id} not found")
             return None
