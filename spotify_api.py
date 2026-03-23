@@ -13,7 +13,9 @@ import sys
 import io
 import contextlib
 import platform
+import subprocess as sp
 
+from utils.utils import find_system_ffmpeg, get_clean_env
 from utils.vendor_bootstrap import bootstrap_vendor_paths
 bootstrap_vendor_paths()
 
@@ -542,6 +544,9 @@ class SpotifyAPI:
         # For backward compatibility, keep oauth_handler pointing to librespot handler
         self.oauth_handler: Optional[OAuth] = self.librespot_oauth_handler
         
+        # Initialize Web API client for ISRC extraction (lazy initialized if credentials provided)
+        self.client: Optional[any] = None 
+        
         # Token storage for librespot (only needed for downloads)
         self.librespot_stored_token: Optional[StoredToken] = None
         
@@ -921,6 +926,57 @@ class SpotifyAPI:
             except OSError as e:
                 self.logger.warning(f"Could not remove credentials file {self.credentials_file_path}: {e}")
 
+    def _init_web_api_client(self) -> bool:
+        """
+        Initializes the Web API client (self.client) using Client Credentials flow if possible.
+        This provides a way to fetch ISRC and other metadata without a full user session.
+        """
+        if self.client:
+            return True
+            
+        client_id = (self.config.get('client_id', '') or '').strip()
+        client_secret = (self.config.get('client_secret', '') or '').strip()
+        
+        if not client_id or not client_secret:
+            self.logger.debug("Web API Client Credentials flow skipped: missing client_id or client_secret.")
+            return False
+            
+        try:
+            self.logger.info("Initializing Web API client via Client Credentials flow...")
+            payload = {
+                'grant_type': 'client_credentials',
+                'client_id': client_id,
+                'client_secret': client_secret
+            }
+            response = requests.post(AUTH_URL + "api/token", data=payload, timeout=DEFAULT_REQUEST_TIMEOUT)
+            response.raise_for_status()
+            token_data = response.json()
+            access_token = token_data.get('access_token')
+            
+            if access_token:
+                # We'll use a simple wrapper or just the token for direct requests
+                # If spotipy is available, we could use it, but direct requests are safer here
+                self.web_api_token = access_token
+                # Create a minimal client object compatible with track() call
+                class WebApiClient:
+                    def __init__(self, token, logger):
+                        self.token = token
+                        self.logger = logger
+                    def track(self, track_id):
+                        headers = {"Authorization": f"Bearer {self.token}"}
+                        url = f"https://api.spotify.com/v1/tracks/{track_id}"
+                        r = requests.get(url, headers=headers, timeout=10)
+                        r.raise_for_status()
+                        return r.json()
+                
+                self.client = WebApiClient(access_token, self.logger)
+                self.logger.info("Web API client successfully initialized for metadata enhancement.")
+                return True
+        except Exception as e:
+            self.logger.warning(f"Failed to initialize Web API client via Client Credentials flow: {e}")
+            
+        return False
+
     def _load_credentials_and_init_session(self) -> bool:
         """Loads existing OAuth credentials or performs PKCE flow, then creates librespot session.
         Only required for downloading audio, not for metadata operations."""
@@ -1285,24 +1341,87 @@ class SpotifyAPI:
                 self.logger.warning("_save_stream_to_temp_file: Could not import core_codec_data, using default .ogg suffix.")
             except KeyError:
                 self.logger.warning(f"_save_stream_to_temp_file: Codec {determined_codec_enum} not in core_codec_data, using default .ogg suffix.")
-            with tempfile.NamedTemporaryFile(delete=False, suffix=file_suffix, dir=target_temp_dir) as temp_file:
-                temp_file_path = temp_file.name
-                self.logger.info(f"Attempting to save stream to {temp_file_path}...")
-                bytes_written = 0
-                if hasattr(stream_object, 'read') and callable(stream_object.read):
-                    while True:
-                        chunk = stream_object.read(8192)
-                        if not chunk:
-                            break
-                        temp_file.write(chunk)
-                        bytes_written += len(chunk)
-                    self.logger.info(f"Finished writing stream to {temp_file_path} ({bytes_written} bytes).")
-                else: 
-                    self.logger.error(f"Stream object for {temp_file_path} does not have a callable .read() method. Trying iteration as fallback.")
-                    for chunk_iter in stream_object: 
-                        temp_file.write(chunk_iter)
-                        bytes_written += len(chunk_iter)
-                    self.logger.info(f"Finished writing stream (iteration fallback) to {temp_file_path} ({bytes_written} bytes).")
+            
+            ffmpeg_found, ffmpeg_path = find_system_ffmpeg()
+            use_ffmpeg_mux = (determined_codec_enum == CodecEnum.VORBIS and ffmpeg_found)
+            
+            if use_ffmpeg_mux:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=file_suffix, dir=target_temp_dir) as temp_file:
+                    temp_file_path = temp_file.name
+                
+                self.logger.info(f"Using FFmpeg to mux raw Vorbis stream to {temp_file_path}...")
+                
+                # Try without -f vorbis first to see if auto-detect works, as some Vorbis streams have slight framing
+                cmd = [ffmpeg_path, '-y', '-hide_banner', '-i', 'pipe:0', '-c:a', 'copy', '-f', 'ogg', temp_file_path]
+                self.logger.debug(f"FFmpeg command: {' '.join(cmd)}")
+                
+                process = sp.Popen(cmd, stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.PIPE, env=get_clean_env())
+                
+                bytes_pushed = 0
+                try:
+                    if hasattr(stream_object, 'read') and callable(stream_object.read):
+                        while True:
+                            chunk = stream_object.read(16384) # Larger chunks for efficiency
+                            if not chunk:
+                                break
+                            process.stdin.write(chunk)
+                            bytes_pushed += len(chunk)
+                    else:
+                        for chunk_iter in stream_object:
+                            process.stdin.write(chunk_iter)
+                            bytes_pushed += len(chunk_iter)
+                    
+                    process.stdin.close()
+                    stdout, stderr = process.communicate()
+                    
+                    if process.returncode != 0:
+                        stderr_text = stderr.decode('utf-8', 'ignore')
+                        self.logger.error(f"FFmpeg muxing failed with return code {process.returncode}. Error: {stderr_text}")
+                        
+                        # LOG TO FILE TO ENSURE USER CAN SEE IT
+                        try:
+                            with open("ffmpeg_error.txt", "w") as f:
+                                f.write(f"Command: {' '.join(cmd)}\n")
+                                f.write(f"Return code: {process.returncode}\n")
+                                f.write(f"Error:\n{stderr_text}\n")
+                        except: pass
+                        
+                        # Fallback: if muxing failed, the output file might be corrupted. 
+                        # We delete it and return None so the user sees a failure, but we could fallback to raw.
+                        # However, since we already read the stream, we can't just re-read it.
+                        if os.path.exists(temp_file_path): os.unlink(temp_file_path)
+                        return None
+                    
+                    bytes_written = os.path.getsize(temp_file_path)
+                    self.logger.info(f"FFmpeg muxing completed. Pushed {bytes_pushed} bytes, result size: {bytes_written} bytes.")
+                except Exception as mux_err:
+                    self.logger.error(f"Error during FFmpeg muxing process: {mux_err}")
+                    if process.poll() is None:
+                        process.kill()
+                    return None
+            else:
+                if determined_codec_enum == CodecEnum.VORBIS and not ffmpeg_found:
+                    self.logger.warning("FFmpeg NOT found! Saving raw Vorbis stream WITHOUT Ogg container. Tagging WILL likely fail.")
+
+                with tempfile.NamedTemporaryFile(delete=False, suffix=file_suffix, dir=target_temp_dir) as temp_file:
+                    temp_file_path = temp_file.name
+                    self.logger.info(f"Attempting to save stream to {temp_file_path}...")
+                    bytes_written = 0
+                    if hasattr(stream_object, 'read') and callable(stream_object.read):
+                        while True:
+                            chunk = stream_object.read(8192)
+                            if not chunk:
+                                break
+                            temp_file.write(chunk)
+                            bytes_written += len(chunk)
+                        self.logger.info(f"Finished writing stream to {temp_file_path} ({bytes_written} bytes).")
+                    else: 
+                        self.logger.error(f"Stream object for {temp_file_path} does not have a callable .read() method. Trying iteration as fallback.")
+                        for chunk_iter in stream_object: 
+                            temp_file.write(chunk_iter)
+                            bytes_written += len(chunk_iter)
+                        self.logger.info(f"Finished writing stream (iteration fallback) to {temp_file_path} ({bytes_written} bytes).")
+            
             self.logger.info(f"Temporary file size for {temp_file_path}: {bytes_written} bytes.")
             if bytes_written == 0:
                 self.logger.error(f"Temporary file {temp_file_path} is empty after saving!")
@@ -1731,16 +1850,43 @@ class SpotifyAPI:
             
             gid_hex_value = self._convert_base62_to_gid_hex(track_id) 
             
-            # Try to get more album details (like total tracks) by fetching album info logic if needed? 
-            # For now, simplistic approach is fine.
-            album_total_tracks = None
+            # Extract ISRC if available
+            isrc = None
+            external_ids = track_union.get('externalIds', {})
+            if external_ids:
+                eid_items = external_ids.get('items', [])
+                for eid in eid_items:
+                    if eid.get('type') == 'ISRC':
+                        isrc = eid.get('id')
+                        break
             
+            # If Embed API (unauthenticated) doesn't have it, try the authenticated Web API
+            if not isrc:
+                # Lazy-init Web API client if valid client credentials exist
+                if not self.client:
+                    self._init_web_api_client()
+                    
+                if self.client:
+                    try:
+                        self.logger.debug(f"ISRC not in Embed API, trying Web API for {track_id}")
+                        api_track = self.client.track(track_id)
+                        isrc = api_track.get('external_ids', {}).get('isrc')
+                        if isrc:
+                             self.logger.debug(f"Found ISRC via Web API: {isrc}")
+                        
+                        # While we're here, let's enrich track_info if needed
+                        # (Not strictly necessary for tagging since we have tags_obj, but good for completeness)
+                        # We'll attach it later
+                    except Exception as api_err:
+                        self.logger.warning(f"Failed to fetch ISRC via Web API: {api_err}")
+
             tags_obj = Tags(
                 album_artist=artist_names, # Use track artists as fallback
                 track_number=str(track_number) if track_number is not None else None,
                 total_tracks=None,
                 disc_number=str(disc_number) if disc_number is not None else None,
                 release_date=album_release_date_str,
+                isrc=isrc,
             )
             
             track_info_instance = TrackInfo(
@@ -1992,6 +2138,14 @@ class SpotifyAPI:
                     cover_url = f"https://i.scdn.co/image/{file_id_hex}"
                     break # Use first found
             
+            # Extract ISRC if available
+            isrc = None
+            if hasattr(track_obj, 'external_id') and track_obj.external_id:
+                for ex_id in track_obj.external_id:
+                    if hasattr(ex_id, 'type') and str(ex_id.type).lower() == 'isrc':
+                        isrc = ex_id.id
+                        break
+
             # Tags
             tags_obj = Tags(
                 album_artist=artist_names, # fallback
@@ -1999,6 +2153,7 @@ class SpotifyAPI:
                 total_tracks=None, # Not easily available in track obj
                 disc_number=str(track_obj.disc_number),
                 release_date=release_date_str,
+                isrc=isrc,
             )
             
             track_info_instance = TrackInfo(

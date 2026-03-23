@@ -674,7 +674,10 @@ class ModuleInterface:
             # First, attempt to get track info from spotify_api
             track_info_result = self.spotify_api.get_track_info(track_id, quality_tier, codec_options, **extra_kwargs)
             if track_info_result:
-                if not auth_ok:
+                # Only attach error if we have NO metadata at all or if it's a known restricted track
+                # If we have basic info (name, artists) and potentially ISRC, don't scare the user here.
+                # Auth will be re-checked (and prompted if needed) during actual download.
+                if not auth_ok and not track_info_result.tags.isrc:
                     track_info_result.error = error_msg
                 self.logger.info(f"Successfully retrieved TrackInfo for track ID: {track_id}, Name: {track_info_result.name}")
                 return track_info_result
@@ -1180,6 +1183,29 @@ class ModuleInterface:
             if len(tracks) != num_tracks_from_api:
                 self.logger.warning(f"Playlist {playlist_id}: Number of tracks from API ({num_tracks_from_api}) differs from successfully parsed tracks ({len(tracks)}). Some tracks may have failed to parse or were unavailable.")
 
+            # Batch fetch missing release years for playlist tracks (Embed API)
+            missing_year_tracks = [t for t in tracks if not t.release_year]
+            if missing_year_tracks:
+                self.logger.info(f"Playlist {playlist_id}: Batch fetching missing years for {len(missing_year_tracks)} tracks...")
+                album_ids = list(set(t.album_id for t in missing_year_tracks if t.album_id))
+                album_dates = {}
+                
+                def _fetch_spotify_album_date(aid):
+                    try:
+                        a_data = self.spotify_api.embed_client.get_album_metadata(aid)
+                        release_date = a_data.get('albumUnion', {}).get('date', {}).get('isoString')
+                        if release_date: return aid, int(str(release_date).split('-')[0])
+                    except: pass
+                    return aid, None
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                    for aid, y in executor.map(_fetch_spotify_album_date, album_ids):
+                        if y: album_dates[aid] = y
+                
+                for t in missing_year_tracks:
+                    if t.album_id in album_dates:
+                        t.release_year = album_dates[t.album_id]
+
             playlist_info_obj = PlaylistInfo(
                 name=playlist_name,
                 creator=creator_name,
@@ -1404,6 +1430,12 @@ class ModuleInterface:
             if parsed_tracks: # After fetching all tracks, determine if album is explicit
                 is_explicit_album = any(track.explicit for track in parsed_tracks if hasattr(track, 'explicit'))
                 self.logger.info(f"Determined album explicit status as: {is_explicit_album} based on parsed tracks.")
+
+                # Ensure tracks inherit the album's release year if they don't have one
+                if release_year:
+                    for track in parsed_tracks:
+                        if not getattr(track, 'release_year', 0):
+                            track.release_year = release_year
 
             self.logger.info(f"Successfully parsed {len(parsed_tracks)} full TrackInfo objects for album '{album_name}'. API reported {total_tracks_api} tracks initially.")
 
