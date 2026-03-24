@@ -1386,19 +1386,19 @@ class SpotifyAPI:
                                 f.write(f"Error:\n{stderr_text}\n")
                         except: pass
                         
-                        # Fallback: if muxing failed, the output file might be corrupted. 
-                        # We delete it and return None so the user sees a failure, but we could fallback to raw.
-                        # However, since we already read the stream, we can't just re-read it.
+                        # Raise error instead of returning None
                         if os.path.exists(temp_file_path): os.unlink(temp_file_path)
-                        return None
+                        raise SpotifyApiError(f"FFmpeg muxing failed (code {process.returncode}). See ffmpeg_error.txt for details. Error snippet: {stderr_text[:100]}...")
                     
                     bytes_written = os.path.getsize(temp_file_path)
                     self.logger.info(f"FFmpeg muxing completed. Pushed {bytes_pushed} bytes, result size: {bytes_written} bytes.")
+                except SpotifyApiError:
+                    raise
                 except Exception as mux_err:
                     self.logger.error(f"Error during FFmpeg muxing process: {mux_err}")
                     if process.poll() is None:
                         process.kill()
-                    return None
+                    raise SpotifyApiError(f"Error during FFmpeg muxing process: {mux_err}") from mux_err
             else:
                 if determined_codec_enum == CodecEnum.VORBIS and not ffmpeg_found:
                     self.logger.warning("FFmpeg NOT found! Saving raw Vorbis stream WITHOUT Ogg container. Tagging WILL likely fail.")
@@ -1426,8 +1426,10 @@ class SpotifyAPI:
             if bytes_written == 0:
                 self.logger.error(f"Temporary file {temp_file_path} is empty after saving!")
                 if os.path.exists(temp_file_path): os.unlink(temp_file_path)
-                return None
+                raise SpotifyApiError(f"Downloaded temporary file is empty ({temp_file_path})")
             return temp_file_path
+        except SpotifyApiError:
+            raise
         except Exception as save_err:
             self.logger.error(f"Failed during stream saving to temp file: {save_err}", exc_info=True)
             if temp_file_path and os.path.exists(temp_file_path):
@@ -1435,7 +1437,7 @@ class SpotifyAPI:
                     os.unlink(temp_file_path)
                 except OSError as e_unlink:
                     self.logger.error(f"Error removing temp file {temp_file_path} after save error: {e_unlink}")
-            return None
+            raise SpotifyApiError(f"Failed during stream saving to temp file: {save_err}") from save_err
         finally:
             if stream_object and hasattr(stream_object, 'close') and callable(stream_object.close):
                 try:
@@ -1463,6 +1465,15 @@ class SpotifyAPI:
             self.logger.error("Librespot session is not active or not logged in for track download.")
             if not self._load_credentials_and_init_session() or not self._is_session_valid(self.librespot_session):
                  raise SpotifyAuthError("Authentication required/failed for track download.")
+        
+        # Diagnostic logging for platform and environment
+        import platform
+        self.logger.info(f"Platform: {platform.system()} {platform.release()} ({platform.machine()})")
+        is_frozen = getattr(sys, 'frozen', False)
+        self.logger.info(f"Environment: {'Frozen/Bundle' if is_frozen else 'Source/Python'}")
+        ffmpeg_found, ffmpeg_path = find_system_ffmpeg()
+        self.logger.info(f"FFmpeg Status: {'Found at ' + ffmpeg_path if ffmpeg_found else 'NOT FOUND'}")
+        
         track_id_obj = TrackId.from_hex(track_id_hex)
         temp_file_path = None
         try:
