@@ -1373,8 +1373,9 @@ class SpotifyAPI:
                             try:
                                 process.stdin.write(chunk)
                                 bytes_pushed += len(chunk)
-                            except (BrokenPipeError, OSError) as write_err:
-                                self.logger.error(f"Failed to write to FFmpeg stdin: {write_err}")
+                            except (BrokenPipeError, OSError, ValueError) as write_err:
+                                # Catching ValueError specifically for "Flush of closed file"
+                                self.logger.error(f"Failed to write to FFmpeg stdin (stream broken): {write_err}")
                                 break
                     else:
                         for chunk_iter in stream_object:
@@ -1384,13 +1385,15 @@ class SpotifyAPI:
                             try:
                                 process.stdin.write(chunk_iter)
                                 bytes_pushed += len(chunk_iter)
-                            except (BrokenPipeError, OSError) as write_err:
-                                self.logger.error(f"Failed to write to FFmpeg stdin (iteration): {write_err}")
+                            except (BrokenPipeError, OSError, ValueError) as write_err:
+                                # Catching ValueError specifically for "Flush of closed file"
+                                self.logger.error(f"Failed to write to FFmpeg stdin (iteration broken): {write_err}")
                                 break
                     
                     try:
-                        process.stdin.close()
-                    except (BrokenPipeError, OSError):
+                        if not process.stdin.closed:
+                            process.stdin.close()
+                    except (BrokenPipeError, OSError, ValueError):
                         pass # Stdin might already be closed if FFmpeg died
 
                     stdout, stderr = process.communicate()
@@ -1399,17 +1402,23 @@ class SpotifyAPI:
                         stderr_text = stderr.decode('utf-8', 'ignore')
                         self.logger.error(f"FFmpeg muxing failed with return code {process.returncode}. Error: {stderr_text}")
                         
-                        # LOG TO FILE TO ENSURE USER CAN SEE IT
+                        # LOG TO FILE IN PROJECT ROOT TO ENSURE USER CAN FIND IT
+                        ffmpeg_log_path = os.path.join(project_root_for_temp, "ffmpeg_error.txt")
                         try:
-                            with open("ffmpeg_error.txt", "w") as f:
+                            with open(ffmpeg_log_path, "w") as f:
                                 f.write(f"Command: {' '.join(cmd)}\n")
+                                f.write(f"FFmpeg Path: {ffmpeg_path}\n")
                                 f.write(f"Return code: {process.returncode}\n")
-                                f.write(f"Error:\n{stderr_text}\n")
-                        except: pass
+                                f.write(f"Error Output:\n{stderr_text}\n")
+                            self.logger.info(f"FFmpeg error details have been written to {ffmpeg_log_path}")
+                        except Exception as log_err: 
+                            self.logger.warning(f"Could not write ffmpeg_error.txt to {ffmpeg_log_path}: {log_err}")
                         
                         # Raise error instead of returning None
-                        if os.path.exists(temp_file_path): os.unlink(temp_file_path)
-                        raise SpotifyApiError(f"FFmpeg muxing failed (code {process.returncode}). See ffmpeg_error.txt for details. Error snippet: {stderr_text[:100]}...")
+                        if os.path.exists(temp_file_path): 
+                            try: os.unlink(temp_file_path)
+                            except: pass
+                        raise SpotifyApiError(f"Spotify FFmpeg muxing failed (code {process.returncode}). See {os.path.basename(ffmpeg_log_path)} for details. Error snippet: {stderr_text[:100]}...")
                     
                     bytes_written = os.path.getsize(temp_file_path)
                     self.logger.info(f"FFmpeg muxing completed. Pushed {bytes_pushed} bytes, result size: {bytes_written} bytes.")
