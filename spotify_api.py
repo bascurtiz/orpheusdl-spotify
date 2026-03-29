@@ -1396,8 +1396,11 @@ class SpotifyAPI:
                     try:
                         if not process.stdin.closed:
                             process.stdin.close()
+                            # Critical: prevent communicate() from trying to flush a closed pipe on macOS/Linux
+                            process.stdin = None
                     except (BrokenPipeError, OSError, ValueError):
-                        pass # Stdin might already be closed if FFmpeg died
+                        # Ensure it's None even on failure
+                        process.stdin = None
 
                     stdout, stderr = process.communicate()
                     

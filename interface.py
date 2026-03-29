@@ -935,7 +935,7 @@ class ModuleInterface:
         
         return stream_info
 
-    def get_track_download(self, track_id: str = None, quality_tier: QualityEnum = None, **kwargs) -> Optional[TrackDownloadInfo]:
+    def get_track_download(self, track_id: str = None, quality_tier: QualityEnum = None, codec_options: CodecOptions = None, **kwargs) -> Optional[TrackDownloadInfo]:
         # Ensure authentication before proceeding
         if not self._ensure_authenticated("get_track_download"):
             self.logger.warning("Authentication failed in get_track_download, cannot proceed.")
@@ -946,6 +946,8 @@ class ModuleInterface:
             track_id = kwargs.get("track_id")
         if quality_tier is None:
             quality_tier = kwargs.get("quality_tier")
+        if codec_options is None:
+            codec_options = kwargs.get("codec_options") or kwargs.get("codec_data")
             
         track_info = kwargs.get("track_info_obj")
         
