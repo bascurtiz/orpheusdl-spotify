@@ -1361,17 +1361,38 @@ class SpotifyAPI:
                 try:
                     if hasattr(stream_object, 'read') and callable(stream_object.read):
                         while True:
-                            chunk = stream_object.read(16384) # Larger chunks for efficiency
+                            # Check if FFmpeg has died prematurely
+                            if process.poll() is not None:
+                                self.logger.error("FFmpeg process terminated prematurely while writing stream.")
+                                break
+
+                            chunk = stream_object.read(16384)
                             if not chunk:
                                 break
-                            process.stdin.write(chunk)
-                            bytes_pushed += len(chunk)
+                            
+                            try:
+                                process.stdin.write(chunk)
+                                bytes_pushed += len(chunk)
+                            except (BrokenPipeError, OSError) as write_err:
+                                self.logger.error(f"Failed to write to FFmpeg stdin: {write_err}")
+                                break
                     else:
                         for chunk_iter in stream_object:
-                            process.stdin.write(chunk_iter)
-                            bytes_pushed += len(chunk_iter)
+                            if process.poll() is not None:
+                                self.logger.error("FFmpeg process terminated prematurely while writing stream (iteration).")
+                                break
+                            try:
+                                process.stdin.write(chunk_iter)
+                                bytes_pushed += len(chunk_iter)
+                            except (BrokenPipeError, OSError) as write_err:
+                                self.logger.error(f"Failed to write to FFmpeg stdin (iteration): {write_err}")
+                                break
                     
-                    process.stdin.close()
+                    try:
+                        process.stdin.close()
+                    except (BrokenPipeError, OSError):
+                        pass # Stdin might already be closed if FFmpeg died
+
                     stdout, stderr = process.communicate()
                     
                     if process.returncode != 0:

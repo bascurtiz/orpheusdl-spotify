@@ -1036,8 +1036,9 @@ class ModuleInterface:
         except SpotifyApiError as e:
             error_str = str(e)
             # Detect 401 (token expired) and attempt automatic re-authentication
-            if '401' in error_str:
-                self.logger.warning(f"Token expired (401) detected during track download. Attempting re-authentication...")
+            is_auth_error = '401' in error_str or 'unauthorized' in error_str.lower()
+            
+            if is_auth_error:
                 self.printer.oprint("Spotify token expired. Re-authenticating...", drop_level=0)
                 
                 reauth_success = False
@@ -1071,11 +1072,11 @@ class ModuleInterface:
                         self.logger.error(f"Retry after reauth failed: {retry_err}", exc_info=self.debug_mode)
                         return None
                 else:
-                    self.printer.oprint(f"Re-authentication failed. Spotify API error: {e}", drop_level=0)
+                    self.printer.oprint(f"Re-authentication failed. {e}", drop_level=0)
                     return None
             else:
                 self.printer.oprint(f"Spotify API error during track download: {e}", drop_level=0)
-                self.logger.error(f"SpotifyApiError in get_track_download: {e}", exc_info=self.debug_mode)
+                self.logger.error(f"SpotifyApiError during track download: {e}", exc_info=self.debug_mode)
                 return None
         except Exception as e:
             self.printer.oprint(f"An unexpected error occurred during Spotify track download: {e}", drop_level=0)
