@@ -1349,13 +1349,16 @@ class SpotifyAPI:
                 with tempfile.NamedTemporaryFile(delete=False, suffix=file_suffix, dir=target_temp_dir) as temp_file:
                     temp_file_path = temp_file.name
                 
-                self.logger.info(f"Using FFmpeg to mux raw Vorbis stream to {temp_file_path}...")
-                
+                self.logger.info(f"Using FFmpeg at: {ffmpeg_path}")
                 # Try without -f vorbis first to see if auto-detect works, as some Vorbis streams have slight framing
                 cmd = [ffmpeg_path, '-y', '-hide_banner', '-i', 'pipe:0', '-c:a', 'copy', '-f', 'ogg', temp_file_path]
                 self.logger.debug(f"FFmpeg command: {' '.join(cmd)}")
                 
-                process = sp.Popen(cmd, stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.PIPE, env=get_clean_env())
+                try:
+                    process = sp.Popen(cmd, stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.PIPE, env=get_clean_env())
+                except Exception as popen_err:
+                    self.logger.error(f"Failed to start FFmpeg process: {popen_err}")
+                    raise SpotifyApiError(f"Failed to start FFmpeg: {popen_err}")
                 
                 bytes_pushed = 0
                 try:
@@ -1426,8 +1429,26 @@ class SpotifyAPI:
                     raise
                 except Exception as mux_err:
                     self.logger.error(f"Error during FFmpeg muxing process: {mux_err}")
-                    if process.poll() is None:
-                        process.kill()
+                    
+                    # Try to capture whatever FFmpeg output we can
+                    try:
+                        if 'process' in locals() and process:
+                            if process.poll() is None:
+                                process.kill()
+                            out, err = process.communicate(timeout=2)
+                            if err:
+                                self.logger.error(f"FFmpeg stderr during failure: {err.decode('utf-8', 'ignore')}")
+                    except: pass
+                    
+                    # Ensure we log the path we are trying to use for the error file
+                    try:
+                        ffmpeg_log_path = os.path.join(project_root_for_temp, "ffmpeg_error.txt")
+                        self.logger.info(f"Attempting to write diagnostic info to: {ffmpeg_log_path}")
+                        with open(ffmpeg_log_path, "w") as f:
+                            f.write(f"Exception Message: {mux_err}\n")
+                            f.write(f"Command: {' '.join(cmd)}\n")
+                    except: pass
+                    
                     raise SpotifyApiError(f"Error during FFmpeg muxing process: {mux_err}") from mux_err
             else:
                 if determined_codec_enum == CodecEnum.VORBIS and not ffmpeg_found:
