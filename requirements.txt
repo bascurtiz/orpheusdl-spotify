@@ -1,3 +1,8 @@
 # Requirements for the OrpheusDL Spotify module
 # Librespot is now vendored in the root `vendor/librespot` directory.
 pkce>=1.0.3
+unplayplay>=0.0.1
+pycryptodome
+protobuf
+httpx
+pybase62

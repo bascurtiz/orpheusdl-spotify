@@ -1515,37 +1515,69 @@ class SpotifyAPI:
             self.logger.error(f"Failed to convert track_id '{track_id_base62}' to hex GID format")
             raise SpotifyApiError(f"Failed to convert track_id '{track_id_base62}' to hex GID format")
 
+        try:
+            from utils.models import CodecEnum
+            import os
+            project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+            
+            cookie_path = self.config.get("cookies_path")
+            if not cookie_path:
+                cookie_path = os.path.join(project_root, 'config', 'spotify-cookies.txt')
+                
+            dll_path = self.config.get("spotify_dll_path")
+            if not dll_path:
+                dll_path = os.path.join(project_root, 'Spotify.dll')
+                
+            qt_str = ""
+            if hasattr(quality_tier, 'name'):
+                qt_str = quality_tier.name.upper()
+            elif isinstance(quality_tier, str):
+                qt_str = quality_tier.upper()
+
+            is_flac_requested = (download_options and hasattr(download_options, 'codec') and download_options.codec == CodecEnum.FLAC) or qt_str in ["LOSSLESS", "HIFI", "FLAC_24"]
+                
+            if is_flac_requested:
+                if os.path.exists(cookie_path) and os.path.exists(dll_path):
+                    self.logger.info("FLAC (Lossless/HiFi) requested and credentials found, switching to Desktop API download flow.")
+                    return self._download_desktop_flac(track_id_base62, track_info_obj, quality_tier)
+                else:
+                    self.logger.warning(f"FLAC requested, but missing files checking cookies='{cookie_path}', dll='{dll_path}'. Falling back to default.")
+        except ImportError:
+            pass
+
         if not self._is_session_valid(self.librespot_session):
             self.logger.error("Librespot session is not active or not logged in for track download.")
             if not self._load_credentials_and_init_session() or not self._is_session_valid(self.librespot_session):
                  raise SpotifyAuthError("Authentication required/failed for track download.")
         
-        # Diagnostic logging for platform and environment
-        import platform
-        self.logger.info(f"Platform: {platform.system()} {platform.release()} ({platform.machine()})")
-        is_frozen = getattr(sys, 'frozen', False)
-        self.logger.info(f"Environment: {'Frozen/Bundle' if is_frozen else 'Source/Python'}")
         ffmpeg_found, ffmpeg_path = find_system_ffmpeg()
-        self.logger.info(f"FFmpeg Status: {'Found at ' + ffmpeg_path if ffmpeg_found else 'NOT FOUND'}")
         
         track_id_obj = TrackId.from_hex(track_id_hex)
         temp_file_path = None
         try:
             self.logger.info(f"Fetching librespot Track metadata for GID hex: {track_id_hex}")
-            librespot_audio_quality_mode = LibrespotAudioQualityEnum.NORMAL
+            # Verbose logging to diagnose the quality tier input issue
+            qt_type = type(quality_tier).__name__
+            qt_val = str(quality_tier)
             qt_str = None
             if hasattr(quality_tier, 'name'):
                 qt_str = quality_tier.name.upper()
             elif isinstance(quality_tier, str):
                 qt_str = quality_tier.upper()
-            if qt_str == "LOSSLESS" or qt_str == "HIFI" or qt_str == "VERY_HIGH":
+            
+            # Robust mapping between Orpheus quality tiers and Librespot AudioQuality modes
+            # NORMAL = 96k (0), HIGH = 160k (1), VERY_HIGH = 320k (2)
+            if qt_str in ["LOSSLESS", "HIFI", "VERY_HIGH", "HIGH", "FLAC_24"]:
                 librespot_audio_quality_mode = LibrespotAudioQualityEnum.VERY_HIGH
-            elif qt_str == "HIGH":
+                display_bitrate = 320
+            elif qt_str in ["LOW", "NORMAL", "MEDIUM"]:
                 librespot_audio_quality_mode = LibrespotAudioQualityEnum.HIGH
-            elif qt_str == "LOW":
-                # LOW doesn't exist in librespot, map to NORMAL (lowest available quality)
+                display_bitrate = 160
+            else:
                 librespot_audio_quality_mode = LibrespotAudioQualityEnum.NORMAL
-            self.logger.info(f"Quality tier input: '{quality_tier}', resolved to string: '{qt_str}', mapped to librespot AudioQuality mode: {librespot_audio_quality_mode}")
+                display_bitrate = 96
+
+            self.logger.info(f"Quality tier input: '{qt_val}' ({qt_type}), resolved to '{qt_str}', mapped to librespot: {librespot_audio_quality_mode.name if hasattr(librespot_audio_quality_mode, 'name') else librespot_audio_quality_mode} ({display_bitrate}kbps)")
             # Ensure our audio key filter is still active before librespot operations
             if hasattr(self, '_audio_key_filter'):
                 # Reapply filter to ensure it's active for this operation
@@ -1600,11 +1632,16 @@ class SpotifyAPI:
                         self.logger.warning(f"Exception while closing input_stream after save failure for track {track_id_hex}: {close_ex}")
                 return None
             self.logger.info(f"Successfully downloaded track {track_id_hex} to {temp_file_path}")
-            if track_info_obj and hasattr(track_info_obj, 'codec'):
-                self.logger.info(f"Updating track_info_obj.codec to VORBIS for track: {track_info_obj.name if hasattr(track_info_obj, 'name') else track_id_hex}")
-                track_info_obj.codec = CodecEnum.VORBIS
-            elif track_info_obj:
-                self.logger.warning(f"track_info_obj for {track_id_hex} provided but has no 'codec' attribute to update.")
+            if track_info_obj:
+                if hasattr(track_info_obj, 'codec'):
+                    track_info_obj.codec = CodecEnum.VORBIS
+                if hasattr(track_info_obj, 'bitrate'):
+                    # Explicitly set the bitrate value based on our early mapping
+                    track_info_obj.bitrate = display_bitrate
+                if hasattr(track_info_obj, 'sample_rate'):
+                    track_info_obj.sample_rate = 44.1
+                if hasattr(track_info_obj, 'bit_depth'):
+                    track_info_obj.bit_depth = 16
             return TrackDownloadInfo(
                 download_type=DownloadEnum.TEMP_FILE_PATH,
                 temp_file_path=temp_file_path,
@@ -1664,6 +1701,100 @@ class SpotifyAPI:
             self.stored_token = None
             self.oauth_handler = None
             self.user_market = None
+
+    def _download_desktop_flac(self, track_id_base62: str, track_info_obj, quality_tier) -> Optional['TrackDownloadInfo']:
+        try:
+            from .desktop_api import DesktopSpotifyApi
+        except ImportError as e:
+            self.logger.error(f"Could not load desktop_api for FLAC download: {e}")
+            raise SpotifyApiError("Desktop API not available. Did you install unplayplay?")
+            
+        cookie_path = self.config.get("cookies_path")
+        dll_path = self.config.get("spotify_dll_path")
+        
+        import os
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+        if not cookie_path:
+            cookie_path = os.path.join(project_root, 'config', 'spotify-cookies.txt')
+        if not dll_path:
+            dll_path = os.path.join(project_root, 'Spotify.dll')
+            
+        sp_dc = None
+        try:
+            with open(cookie_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if "sp_dc" in line and not line.startswith("#"):
+                        parts = line.strip().split("\t")
+                        if len(parts) >= 7 and parts[5] == "sp_dc":
+                            sp_dc = parts[6]
+                            break
+        except Exception as e:
+            self.logger.warning(f"Error reading cookies.txt for sp_dc: {e}")
+            
+        if not sp_dc:
+            self.logger.error("No sp_dc cookie found in cookies.txt")
+            raise SpotifyApiError("No sp_dc cookie found in cookies.txt. FLAC download failed.")
+            
+        self.logger.info("Initializing Desktop API and resolving FLAC format...")
+        try:
+            api = DesktopSpotifyApi(sp_dc, dll_path)
+            api.authenticate()
+            
+            qt_str = getattr(quality_tier, 'name', str(quality_tier)).upper()
+            target_format_id = 16 # FLAC
+            # Attempt 24-bit if highest quality requested
+            if qt_str in ["LOSSLESS", "HIFI", "FLAC_24"]:
+                stream_info = api.get_flac_stream_info(track_id_base62, 22)
+                if stream_info:
+                    target_format_id = 22
+                    self.logger.info("Found FLAC 24-bit stream!")
+                else:
+                    stream_info = api.get_flac_stream_info(track_id_base62, 16)
+                    target_format_id = 16
+                    if stream_info:
+                        self.logger.info("Found standard FLAC stream!")
+            else:
+                stream_info = api.get_flac_stream_info(track_id_base62, 16)
+                target_format_id = 16
+                
+            if not stream_info:
+                self.logger.error("No FLAC stream found for track.")
+                raise SpotifyTrackUnavailableError("FLAC stream is not available.")
+                
+            file_id_hex, stream_url = stream_info
+            
+            self.logger.info(f"Decrypting and downloading FLAC stream ID: {file_id_hex}")
+            decryption_key = api.get_playplay_key(file_id_hex)
+            
+            import tempfile
+            import os
+            project_root_for_temp = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+            target_temp_dir = os.path.join(project_root_for_temp, 'temp')
+            os.makedirs(target_temp_dir, exist_ok=True)
+            
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".flac", dir=target_temp_dir) as temp_file:
+                temp_file_path = temp_file.name
+                
+            api.download_and_decrypt(stream_url, decryption_key, temp_file_path)
+            
+            if track_info_obj:
+                track_info_obj.codec = CodecEnum.FLAC
+                track_info_obj.bitrate = None # Lossless
+                track_info_obj.bit_depth = 24 if target_format_id == 22 else 16
+                track_info_obj.sample_rate = 44.1
+                    
+            from utils.models import DownloadEnum, TrackDownloadInfo
+            return TrackDownloadInfo(
+                download_type=DownloadEnum.TEMP_FILE_PATH,
+                temp_file_path=temp_file_path,
+                different_codec=CodecEnum.FLAC
+            )
+
+        except SpotifyTrackUnavailableError:
+            raise
+        except Exception as e:
+            self.logger.error(f"FLAC desktop download failed: {e}", exc_info=True)
+            raise SpotifyApiError(f"FLAC download failed: {e}")
 
     def authenticate_stream_api(self, is_initial_setup_check: bool = False) -> bool:
         """Alias for _load_credentials_and_init_session to maintain compatibility with interface.py."""
@@ -1876,6 +2007,27 @@ class SpotifyAPI:
             
             album_data = track_union.get('albumOfTrack', {})
             album_name = album_data.get('name')
+            
+            # Extract Label, Copyrights, and UPC from albumOfTrack if available
+            label = album_data.get('label')
+            
+            # GraphQL structure for copyright is usually nested in 'items'
+            album_copyright_data = album_data.get('copyright', {})
+            copyrights_list = album_copyright_data.get('items', [])
+            if not copyrights_list:
+                copyrights_list = album_data.get('copyrights', []) # Fallback
+                
+            copyright_text = ', '.join([c.get('text') for c in copyrights_list if c.get('text')]) if copyrights_list else None
+            
+            upc = None
+            external_ids_album = album_data.get('externalIds', {})
+            if external_ids_album:
+                eid_items_album = external_ids_album.get('items', [])
+                for eid in eid_items_album:
+                    if eid.get('type') == 'UPC':
+                        upc = eid.get('id')
+                        break
+
             album_id_spotify = None
             if album_data.get('uri'):
                  # extract ID from spotify:album:ID
@@ -1925,25 +2077,58 @@ class SpotifyAPI:
                         isrc = eid.get('id')
                         break
             
-            # If Embed API (unauthenticated) doesn't have it, try the authenticated Web API
-            if not isrc:
-                # Lazy-init Web API client if valid client credentials exist
+            # Always check for enrichment if the Label or UPC is missing, as Embed API (GraphQL) often omits them.
+            if not label or not upc or not isrc or not copyright_text:
                 if not self.client:
                     self._init_web_api_client()
                     
                 if self.client:
                     try:
-                        self.logger.debug(f"ISRC not in Embed API, trying Web API for {track_id}")
+                        self.logger.debug(f"Metadata missing in Embed API, trying Web API for {track_id}")
                         api_track = self.client.track(track_id)
-                        isrc = api_track.get('external_ids', {}).get('isrc')
-                        if isrc:
-                             self.logger.debug(f"Found ISRC via Web API: {isrc}")
                         
-                        # While we're here, let's enrich track_info if needed
-                        # (Not strictly necessary for tagging since we have tags_obj, but good for completeness)
-                        # We'll attach it later
+                        if not isrc:
+                            isrc = api_track.get('external_ids', {}).get('isrc')
+                        
+                        # Fetch album details from Web API for UPC, Label, and Copyright
+                        track_album_api = api_track.get('album', {})
+                        api_album_id = track_album_api.get('id')
+                        
+                        if api_album_id:
+                            api_album = self.client.album(api_album_id)
+                            if not upc:
+                                upc = api_album.get('external_ids', {}).get('upc')
+                            if not label:
+                                label = api_album.get('label')
+                            if not copyright_text:
+                                api_copyrights = api_album.get('copyrights', [])
+                                copyright_text = ', '.join([c.get('text') for c in api_copyrights if c.get('text')]) if api_copyrights else None
+                            
+                            # Ensure all potentially enriched strings are cleaned, regardless of which ones were found
+                            if label and hasattr(label, 'strip'): label = label.strip()
+                            if upc and hasattr(upc, 'strip'): upc = upc.strip()
+                            if isrc and hasattr(isrc, 'strip'): isrc = isrc.strip()
+                                
                     except Exception as api_err:
-                        self.logger.warning(f"Failed to fetch ISRC via Web API: {api_err}")
+                        self.logger.warning(f"Failed to enrich metadata via Web API: {api_err}")
+                
+                # --- Double-Nuclear Label Fallback ---
+                # If label is still missing, try to extract it from copyright string
+                if not label and copyright_text:
+                    import re
+                    cp_text = copyright_text
+                    # Remove common copyright prefixes like (P) 2009, (C) 2009, 2009, etc.
+                    cp_text = re.sub(r'^\s*\(?[PCpc]\)?\s*\d{4}\s*', '', cp_text) # (P) 2009
+                    cp_text = re.sub(r'^\s*\d{4}\s*', '', cp_text) # 2009
+                    cp_text = re.sub(r'^\s*Copyright\s*\d{4}\s*', '', cp_text, flags=re.IGNORECASE)
+                    cp_text = re.sub(r'^\s*℗\s*\d{4}\s*', '', cp_text)
+                    cp_text = re.sub(r'^\s*©\s*\d{4}\s*', '', cp_text)
+                    if cp_text and len(cp_text) > 2:
+                         # Clean up multiple comma-separated copyrights
+                        if ',' in cp_text:
+                            cp_text = cp_text.split(',')[0].strip()
+                        label = cp_text.strip()
+                        self.logger.info(f"Extracted Label from Copyright: '{label}'")
 
             tags_obj = Tags(
                 album_artist=artist_names, # Use track artists as fallback
@@ -1952,8 +2137,30 @@ class SpotifyAPI:
                 disc_number=str(disc_number) if disc_number is not None else None,
                 release_date=album_release_date_str,
                 isrc=isrc,
+                upc=upc,
+                label=label,
+                copyright=copyright_text,
             )
             
+            # Determine initial metadata for the UI logs based on requested quality
+            initial_codec = CodecEnum.VORBIS
+            initial_bitrate = 160
+            initial_bit_depth = 16
+            initial_sample_rate = 44.1
+
+            qt_str = ""
+            if hasattr(quality_tier, 'name'):
+                qt_str = quality_tier.name.upper()
+            elif isinstance(quality_tier, str):
+                qt_str = quality_tier.upper()
+
+            if qt_str in ["LOSSLESS", "HIFI", "FLAC_24"]:
+                initial_codec = CodecEnum.FLAC
+                initial_bitrate = None
+                if qt_str == "FLAC_24": initial_bit_depth = 24
+            elif qt_str in ["VERY_HIGH", "HIGH"]:
+                initial_bitrate = 320
+
             track_info_instance = TrackInfo(
                 id=track_id,
                 name=name,
@@ -1965,9 +2172,12 @@ class SpotifyAPI:
                 cover_url=cover_url,
                 explicit=explicit,
                 tags=tags_obj,
-                codec=CodecEnum.VORBIS, 
+                codec=initial_codec, 
                 release_year=album_release_year_int,
                 gid_hex=gid_hex_value,
+                bitrate=initial_bitrate,
+                bit_depth=initial_bit_depth,
+                sample_rate=initial_sample_rate,
             )
             self.logger.debug(f"Successfully created TrackInfo for {track_id}: {name}. Returning object.")
             return track_info_instance
@@ -2083,6 +2293,71 @@ class SpotifyAPI:
                     'is_local': False # Web API field, not relevant here but good to have consistency
                 })
             
+            # Extract UPC if available
+            album_upc = None
+            album_external_ids = album_union.get('externalIds', {})
+            if album_external_ids:
+                album_eid_items = album_external_ids.get('items', [])
+                for eid in album_eid_items:
+                    if eid.get('type') == 'UPC':
+                        album_upc = eid.get('id')
+                        break
+
+            # Extract Label and Copyrights correctly from GraphQL
+            label = album_union.get('label')
+            album_copyright_data = album_union.get('copyright', {})
+            copyrights_list = album_copyright_data.get('items', [])
+            if not copyrights_list:
+                copyrights_list = album_union.get('copyrights', [])
+            
+            # Extract UPC if available
+            album_upc = None
+            album_external_ids = album_union.get('externalIds', {})
+            if album_external_ids:
+                album_eid_items = album_external_ids.get('items', [])
+                for eid in album_eid_items:
+                    if eid.get('type') == 'UPC':
+                        album_upc = eid.get('id')
+                        break
+            
+            # Fallback to Web API for missing fields (especially UPC)
+            if not album_upc or not label or not copyrights_list:
+                if not self.client:
+                    self._init_web_api_client()
+                if self.client:
+                    try:
+                        self.logger.debug(f"Album metadata missing in Embed API, trying Web API for {album_id}")
+                        api_album = self.client.album(album_id)
+                        if not album_upc:
+                            album_upc = api_album.get('external_ids', {}).get('upc')
+                        if not label:
+                            label = api_album.get('label')
+                        if not copyrights_list:
+                            copyrights_list = api_album.get('copyrights', [])
+                    except Exception as api_err:
+                        self.logger.warning(f"Failed to enrich album metadata via Web API: {api_err}")
+                    
+                # --- Double-Nuclear Label Fallback ---
+                # If label is still missing, try to harvest from copyrights_list
+                if not label and copyrights_list:
+                    import re
+                    # Get first copyright text
+                    text = copyrights_list[0].get('text') if isinstance(copyrights_list, list) and isinstance(copyrights_list[0], dict) else (copyrights_list[0] if isinstance(copyrights_list, list) and len(copyrights_list) > 0 else None)
+                    if text:
+                        cp_text = str(text)
+                        # Remove common copyright prefixes like (P) 2009, (C) 2009, 2009, etc.
+                        cp_text = re.sub(r'^\s*\(?[PCpc]\)?\s*\d{4}\s*', '', cp_text) # (P) 2009
+                        cp_text = re.sub(r'^\s*\d{4}\s*', '', cp_text) # 2009
+                        cp_text = re.sub(r'^\s*Copyright\s*\d{4}\s*', '', cp_text, flags=re.IGNORECASE)
+                        cp_text = re.sub(r'^\s*℗\s*\d{4}\s*', '', cp_text)
+                        cp_text = re.sub(r'^\s*©\s*\d{4}\s*', '', cp_text)
+                        if cp_text and len(cp_text) > 2:
+                            # Clean up multiple comma-separated copyrights
+                            if ',' in cp_text:
+                                cp_text = cp_text.split(',')[0].strip()
+                            label = cp_text.strip()
+                            self.logger.info(f"Extracted Label from Copyright: '{label}'")
+
             # Construct the return dictionary (mimicking Web API response structure)
             album_data = {
                 'id': album_id,
@@ -2093,8 +2368,9 @@ class SpotifyAPI:
                 'total_tracks': tracks_v2.get('totalCount') or len(all_track_items),
                 'tracks': {'items': all_track_items, 'total': len(all_track_items)},
                 'album_type': album_union.get('type', 'album').lower() if album_union.get('type') else 'album',
-                'label': album_union.get('label'),
-                'copyrights': album_union.get('copyrights') or []
+                'label': label,
+                'copyrights': copyrights_list,
+                'upc': album_upc
             }
             
             self.logger.info(f"SpotifyAPI.get_album_info: Successfully retrieved album data for {album_id}")
@@ -2106,7 +2382,7 @@ class SpotifyAPI:
             self.logger.error(f"Unexpected error in get_album_info for {album_id}: {e}", exc_info=True)
             raise SpotifyApiError(f"An unexpected error occurred while fetching album {album_id}: {e}")
 
-    def get_track_via_librespot(self, track_id: str) -> Optional[TrackInfo]:
+    def get_track_via_librespot(self, track_id: str, quality_tier: QualityEnum = None) -> Optional[TrackInfo]:
         """
         Fallback method to get track info using Librespot (Mercury) when Web API fails.
         """
@@ -2221,6 +2497,23 @@ class SpotifyAPI:
                 isrc=isrc,
             )
             
+            # Determine initial metadata for the UI logs based on requested quality
+            initial_bitrate = 160
+            initial_bit_depth = 16
+            initial_sample_rate = 44.1
+
+            qt_str = ""
+            if hasattr(quality_tier, 'name'):
+                qt_str = quality_tier.name.upper()
+            elif isinstance(quality_tier, str):
+                qt_str = quality_tier.upper()
+
+            if qt_str in ["LOSSLESS", "HIFI", "FLAC_24"]:
+                initial_bitrate = None
+                if qt_str == "FLAC_24": initial_bit_depth = 24
+            elif qt_str in ["VERY_HIGH", "HIGH"]:
+                initial_bitrate = 320
+
             track_info_instance = TrackInfo(
                 id=track_id,
                 name=name,
@@ -2235,6 +2528,9 @@ class SpotifyAPI:
                 codec=CodecEnum.VORBIS, 
                 release_year=release_year,
                 gid_hex=gid_hex,
+                bitrate=initial_bitrate,
+                bit_depth=initial_bit_depth,
+                sample_rate=initial_sample_rate,
             )
             
             self.logger.debug(f"Successfully created TrackInfo details via Librespot for {track_id}. Returning object.")
@@ -2837,20 +3133,28 @@ class SpotifyAPI:
         temp_file_path = None
         try:
             self.logger.info(f"Fetching librespot Episode metadata for GID hex: {episode_id_hex}")
-            librespot_audio_quality_mode = LibrespotAudioQualityEnum.NORMAL
+            # Verbose logging to diagnose the quality tier input issue
+            qt_type = type(quality_tier).__name__
+            qt_val = str(quality_tier)
             qt_str = None
             if hasattr(quality_tier, 'name'):
                 qt_str = quality_tier.name.upper()
             elif isinstance(quality_tier, str):
                 qt_str = quality_tier.upper()
-            if qt_str == "LOSSLESS" or qt_str == "HIFI" or qt_str == "VERY_HIGH":
+
+            # Robust mapping between Orpheus quality tiers and Librespot AudioQuality modes
+            # NORMAL = 96k (0), HIGH = 160k (1), VERY_HIGH = 320k (2)
+            if qt_str in ["LOSSLESS", "HIFI", "VERY_HIGH", "HIGH", "FLAC_24"]:
                 librespot_audio_quality_mode = LibrespotAudioQualityEnum.VERY_HIGH
-            elif qt_str == "HIGH":
+                display_bitrate = 320
+            elif qt_str in ["LOW", "NORMAL", "MEDIUM"]:
                 librespot_audio_quality_mode = LibrespotAudioQualityEnum.HIGH
-            elif qt_str == "LOW":
-                # LOW doesn't exist in librespot, map to NORMAL (lowest available quality)
+                display_bitrate = 160
+            else:
                 librespot_audio_quality_mode = LibrespotAudioQualityEnum.NORMAL
-            self.logger.info(f"Quality tier input: '{quality_tier}', resolved to string: '{qt_str}', mapped to librespot AudioQuality mode: {librespot_audio_quality_mode}")
+                display_bitrate = 96
+
+            self.logger.info(f"Quality tier input: '{qt_val}' ({qt_type}), resolved to '{qt_str}', mapped to librespot: {librespot_audio_quality_mode.name if hasattr(librespot_audio_quality_mode, 'name') else librespot_audio_quality_mode} ({display_bitrate}kbps)")
             
             # Ensure our audio key filter is still active before librespot operations
             if hasattr(self, '_audio_key_filter'):
@@ -2893,11 +3197,16 @@ class SpotifyAPI:
                 return None
             
             self.logger.info(f"Successfully downloaded episode {episode_id_hex} to {temp_file_path}")
-            if track_info_obj and hasattr(track_info_obj, 'codec'):
-                self.logger.info(f"Updating track_info_obj.codec to VORBIS for episode: {track_info_obj.name if hasattr(track_info_obj, 'name') else episode_id_hex}")
-                track_info_obj.codec = CodecEnum.VORBIS
-            elif track_info_obj:
-                self.logger.warning(f"track_info_obj for {episode_id_hex} provided but has no 'codec' attribute to update.")
+            if track_info_obj:
+                if hasattr(track_info_obj, 'codec'):
+                    track_info_obj.codec = CodecEnum.VORBIS
+                if hasattr(track_info_obj, 'bitrate'):
+                    # Explicitly set the bitrate value based on our early mapping
+                    track_info_obj.bitrate = display_bitrate
+                if hasattr(track_info_obj, 'sample_rate'):
+                    track_info_obj.sample_rate = 44.1
+                if hasattr(track_info_obj, 'bit_depth'):
+                    track_info_obj.bit_depth = 16
             
             return TrackDownloadInfo(
                 download_type=DownloadEnum.TEMP_FILE_PATH,

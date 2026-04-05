@@ -105,12 +105,16 @@ module_information = ModuleInformation(
         "username": "",
         "download_pause_seconds": 30,
         "client_id": "",
-        "client_secret": ""
+        "client_secret": "",
+        "cookies_path": "",
+        "spotify_dll_path": "",
+        "embed_spotify_lyrics": False
     },
     session_settings={},
     module_supported_modes=[
         ModuleModes.download,
-        ModuleModes.covers
+        ModuleModes.covers,
+        ModuleModes.lyrics
     ],
     netlocation_constant=["spotify.com", "open.spotify.com"],
     url_constants={
@@ -1226,7 +1230,7 @@ class ModuleInterface:
             return None
 
     # --- Helper to parse TrackInfo ---
-    def _parse_track_info(self, raw_track_data: dict, index: Optional[int] = None) -> Optional[TrackInfo]:
+    def _parse_track_info(self, raw_track_data: dict, album_data: Optional[dict] = None, index: Optional[int] = None) -> Optional[TrackInfo]:
         track_id_for_logs = raw_track_data.get('id', 'UNKNOWN_ID_IN_PARSE') # Define early for logging
         self.logger.debug(f"Parsing track: {raw_track_data.get('name', 'N/A')} (ID: {track_id_for_logs}, index: {index})")
         try:
@@ -1237,7 +1241,7 @@ class ModuleInterface:
             track_duration_seconds = int(duration_ms / 1000) if duration_ms else 0
 
             # Album related data
-            raw_album_data = raw_track_data.get('album')
+            raw_album_data = raw_track_data.get('album') or album_data
             album_name_str = "Unknown Album"
             album_id_str = None
             album_release_year_int = 0 # Default, TrackInfo expects int
@@ -1285,8 +1289,60 @@ class ModuleInterface:
             tags_obj.track_number = raw_track_data.get('track_number')
             tags_obj.disc_number = raw_track_data.get('disc_number')
             tags_obj.album_artist = primary_album_artist_name_str
-            tags_obj.release_date = album_release_date_str_for_tags # YYYY-MM-DD or YYYY            
-            track_codec_enum = CodecEnum.VORBIS # Placeholder
+            tags_obj.release_date = album_release_date_str_for_tags # YYYY-MM-DD or YYYY
+            
+            # Map enhanced metadata if available in raw_track_data (from SpotifyAPI or album_data)
+            tags_obj.isrc = raw_track_data.get('isrc')
+            tags_obj.upc = raw_track_data.get('upc')
+            tags_obj.label = raw_track_data.get('label')
+            
+            # Explicitly merge from album_data (passed from caller) if missing in raw_track_data
+            if isinstance(album_data, dict):
+                if not tags_obj.upc: tags_obj.upc = album_data.get('upc')
+                if not tags_obj.label: tags_obj.label = album_data.get('label')
+                
+            # Handle copyrights_list or copyright string from album_data context
+            tags_obj.copyright = raw_track_data.get('copyright')
+            if not tags_obj.copyright and isinstance(album_data, dict):
+                copyrights = album_data.get('copyrights') or album_data.get('copyright')
+                if isinstance(copyrights, list):
+                    tags_obj.copyright = ', '.join([c.get('text') for c in copyrights if isinstance(c, dict) and c.get('text')]) or ', '.join(copyrights)
+                elif isinstance(copyrights, str):
+                    tags_obj.copyright = copyrights
+
+            # Also check nested album data (from raw_track_data['album']) for these fields as fallback
+            if isinstance(raw_album_data, dict):
+                if not tags_obj.upc: tags_obj.upc = raw_album_data.get('upc')
+                if not tags_obj.label: tags_obj.label = raw_album_data.get('label') or raw_album_data.get('publisher') or raw_album_data.get('record_label')
+                if not tags_obj.copyright:
+                    copyrights = raw_album_data.get('copyrights') or raw_album_data.get('copyright')
+                    if isinstance(copyrights, list):
+                        tags_obj.copyright = ', '.join([c.get('text') for c in copyrights if isinstance(c, dict) and c.get('text')])
+                    elif isinstance(copyrights, str):
+                        tags_obj.copyright = copyrights
+                
+            # --- Double-Nuclear Label Fallback ---
+            # If label is still missing, try to extract it from copyright string
+            if not tags_obj.label and tags_obj.copyright:
+                import re
+                cp_text = tags_obj.copyright
+                # Remove common copyright prefixes like (P) 2009, (C) 2009, 2009, etc.
+                cp_text = re.sub(r'^\s*\(?[PCpc]\)?\s*\d{4}\s*', '', cp_text) # (P) 2009
+                cp_text = re.sub(r'^\s*\d{4}\s*', '', cp_text) # 2009
+                cp_text = re.sub(r'^\s*Copyright\s*\d{4}\s*', '', cp_text, flags=re.IGNORECASE)
+                cp_text = re.sub(r'^\s*℗\s*\d{4}\s*', '', cp_text)
+                cp_text = re.sub(r'^\s*©\s*\d{4}\s*', '', cp_text)
+                if cp_text and len(cp_text) > 2:
+                    # Clean up multiple comma-separated copyrights
+                    if ',' in cp_text:
+                        cp_text = cp_text.split(',')[0].strip()
+                    tags_obj.label = cp_text.strip()
+                    self.logger.info(f"Extracted Label from Copyright: '{tags_obj.label}'")
+            
+            track_codec_enum = CodecEnum.VORBIS
+            track_bitrate = 160
+            track_sample_rate = 44.1
+            track_bit_depth = 16
 
             # Construct TrackInfo
             track_info_obj = TrackInfo(
@@ -1300,7 +1356,10 @@ class ModuleInterface:
                 release_year=album_release_year_int,
                 duration=track_duration_seconds,
                 explicit=track_explicit_bool,
-                artist_id=primary_track_artist_id_str                
+                artist_id=primary_track_artist_id_str,
+                bitrate=track_bitrate,
+                sample_rate=track_sample_rate,
+                bit_depth=track_bit_depth
             )
             
             # Get the b62 ID and GID hex from raw_track_data (from SpotifyAPI.get_track_info)
@@ -1410,7 +1469,7 @@ class ModuleInterface:
                     if not item or not isinstance(item, dict):
                         continue
                     try:
-                        track_info = self._parse_track_info(item, index=i + 1)
+                        track_info = self._parse_track_info(item, album_data=album_dict, index=i + 1)
                         if track_info:
                             parsed_tracks.append(track_info)
                         else:
@@ -1434,11 +1493,20 @@ class ModuleInterface:
                 is_explicit_album = any(track.explicit for track in parsed_tracks if hasattr(track, 'explicit'))
                 self.logger.info(f"Determined album explicit status as: {is_explicit_album} based on parsed tracks.")
 
-                # Ensure tracks inherit the album's release year if they don't have one
-                if release_year:
-                    for track in parsed_tracks:
-                        if not getattr(track, 'release_year', 0):
-                            track.release_year = release_year
+                # Ensure tracks inherit the album's metadata if they don't have it
+                for track in parsed_tracks:
+                    if not getattr(track, 'release_year', 0):
+                        track.release_year = release_year
+                    
+                    if hasattr(track, 'tags'):
+                        if not track.tags.label: track.tags.label = album_dict.get('label')
+                        if not track.tags.upc: track.tags.upc = album_dict.get('upc')
+                        if not track.tags.copyright:
+                            api_copyrights = album_dict.get('copyrights', [])
+                            if isinstance(api_copyrights, list) and api_copyrights:
+                                track.tags.copyright = ', '.join([c.get('text') for c in api_copyrights if isinstance(c, dict) and c.get('text')])
+                            elif isinstance(api_copyrights, str):
+                                track.tags.copyright = api_copyrights
 
             self.logger.info(f"Successfully parsed {len(parsed_tracks)} full TrackInfo objects for album '{album_name}'. API reported {total_tracks_api} tracks initially.")
 
@@ -1455,8 +1523,112 @@ class ModuleInterface:
                 explicit=is_explicit_album,
                 duration=total_duration_s,
                 track_extra_kwargs=codec_opts if codec_opts is not None else {},
-                id=album_id
+                id=album_id,
+                upc=album_dict.get('upc'),
+                label=album_dict.get('label')
             )
         except Exception as parse_error:
             self.logger.error(f"Failed to parse album data for ID {album_id_for_logs}: {parse_error}")
+            return None
+
+    def get_track_lyrics(self, track_id: str, **kwargs) -> Optional['LyricsInfo']:
+        try:
+            from utils.models import LyricsInfo
+        except ImportError:
+            return None
+
+        # Check if the user enabled spotify lyrics
+        if not self.settings.get('embed_spotify_lyrics', False):
+            if self.debug_mode:
+                self.logger.debug("Spotify lyrics fetching is disabled in settings. Skipping.")
+            return None
+
+        cfg = self.spotify_api.config or {}
+        sp_dc = None
+        cookie_path = cfg.get("cookies_path") or ""
+        
+        # Verify that we have an sp_dc cookie to authenticate as WebPlayer
+        if cookie_path and os.path.exists(cookie_path):
+            try:
+                with open(cookie_path, 'r') as f:
+                    cookie_text = f.read()
+                for line in cookie_text.splitlines():
+                    if line.startswith('#') or not line.strip():
+                        continue
+                    parts = line.strip().split('\t')
+                    if len(parts) >= 7 and parts[5] == 'sp_dc':
+                        sp_dc = parts[6]
+                        break
+            except Exception as e:
+                self.logger.error(f"Failed to read sp_dc cookie for lyrics: {e}")
+
+        if not sp_dc:
+            self.logger.warning("Spotify lyrics fetching requires the sp_dc cookie to authenticate as WebPlayer. Please set cookies_path in settings.")
+            return None
+
+        try:
+            from .desktop_api import SpotifyDeviceFlow, DEVICE_CLIENT_TOKEN
+            import time
+            # Retrieve or reuse the device token
+            if not hasattr(self, '_lyrics_access_token') or getattr(self, '_lyrics_access_token_expires', 0) < time.time():
+                if self.debug_mode:
+                    self.logger.debug("Fetching new Spotify device token for lyrics...")
+                flow = SpotifyDeviceFlow(sp_dc)
+                token_data = flow.get_token()
+                self._lyrics_access_token = token_data["access_token"]
+                self._lyrics_access_token_expires = time.time() + token_data.get("expires_in", 3600) - 300
+
+            import httpx
+            client = httpx.Client(timeout=30)
+            client.headers.update({
+                "accept": "application/json",
+                "app-platform": "WebPlayer",
+                "authorization": f"Bearer {self._lyrics_access_token}",
+                "client-token": DEVICE_CLIENT_TOKEN
+            })
+            
+            # Format track id to base62
+            track_id_base62 = track_id.split(':')[-1]
+            url = f"https://spclient.wg.spotify.com/color-lyrics/v2/track/{track_id_base62}?format=json&vocalRemoval=false"
+            
+            if self.debug_mode:
+                self.logger.debug(f"Fetching Spotify lyrics from {url}")
+                
+            resp = client.get(url)
+            if resp.status_code == 404:
+                self.logger.debug(f"Lyrics not found for track {track_id}")
+                return None
+                
+            resp.raise_for_status()
+            data = resp.json()
+            
+            lines = data.get("lyrics", {}).get("lines", [])
+            if not lines:
+                return None
+                
+            embedded = []
+            synced = []
+            for line in lines:
+                words = line.get("words", "")
+                
+                # The endpoint returns a 0 if the time hasn't been synced occasionally
+                start_ms_raw = line.get("startTimeMs", "0")
+                if not start_ms_raw:
+                    start_ms_raw = "0"
+                start_ms = int(start_ms_raw)
+                
+                embedded.append(words)
+                
+                mins, ms = divmod(start_ms, 60000)
+                secs, ms = divmod(ms, 1000)
+                synced.append(f"[{mins:02d}:{secs:02d}.{ms//10:02d}]{words}")
+                
+            self.logger.info(f"Successfully fetched synced lyrics for track {track_id}")
+            return LyricsInfo(
+                embedded="\n".join(embedded),
+                synced="\n".join(synced)
+            )
+
+        except Exception as e:
+            self.logger.error(f"Error fetching Spotify lyrics: {e}")
             return None
