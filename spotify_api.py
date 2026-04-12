@@ -1534,14 +1534,26 @@ class SpotifyAPI:
             elif isinstance(quality_tier, str):
                 qt_str = quality_tier.upper()
 
-            is_flac_requested = (download_options and hasattr(download_options, 'codec') and download_options.codec == CodecEnum.FLAC) or qt_str in ["LOSSLESS", "HIFI", "FLAC_24"]
+            is_flac_requested = (download_options and hasattr(download_options, 'codec') and download_options.codec == CodecEnum.FLAC) or qt_str in ["LOSSLESS", "HIFI", "FLAC_24", "ATMOS"]
                 
             if is_flac_requested:
                 if os.path.exists(cookie_path) and os.path.exists(dll_path):
-                    self.logger.info("FLAC (Lossless/HiFi) requested and credentials found, switching to Desktop API download flow.")
+                    self.logger.info("FLAC (Lossless/HiFi/Atmos) requested and credentials found, switching to Desktop API download flow.")
                     return self._download_desktop_flac(track_id_base62, track_info_obj, quality_tier)
+                elif not os.path.exists(dll_path):
+                    # Spotify.dll is missing for a high-quality request - abort and show pop-up
+                    error_msg = f"Spotify.dll is missing! To download in Lossless quality (and lyrics), you must place Spotify.dll in your project root:\n\n{dll_path}\n\nYou can download it from the link below."
+                    self.logger.error(error_msg)
+                    
+                    # Trigger GUI pop-up if handler is available
+                    show_dialog = self.module_controller.get_gui_handler("show_missing_component_dialog") if self.module_controller else None
+                    if show_dialog:
+                        mega_url = "https://mega.nz/file/Zdx0FDha#yASfMcAFxqXM9O4yjgqy2-gTZ5qY8DhSb5xsYvlUhsA"
+                        show_dialog("Missing Spotify.dll", error_msg, download_url=mega_url)
+                    
+                    raise SpotifyApiError(f"Download aborted: Spotify.dll is missing for {qt_str} quality.")
                 else:
-                    self.logger.warning(f"FLAC requested, but missing files checking cookies='{cookie_path}', dll='{dll_path}'. Falling back to default.")
+                    self.logger.warning(f"FLAC requested, but missing cookies checking cookies='{cookie_path}'. Falling back to default.")
         except ImportError:
             pass
 
@@ -2041,6 +2053,10 @@ class SpotifyAPI:
             track_number = track_union.get('trackNumber')
             disc_number = track_union.get('discNumber')
             
+            # Get total tracks from album metadata in GraphQL
+            album_tracks_obj = album_data.get('tracks') or album_data.get('tracksV2', {})
+            total_tracks = album_tracks_obj.get('totalCount')
+            
             # Explicit content check
             explicit = track_union.get('contentRating', {}).get('label') == 'EXPLICIT'
             
@@ -2100,6 +2116,8 @@ class SpotifyAPI:
                                 upc = api_album.get('external_ids', {}).get('upc')
                             if not label:
                                 label = api_album.get('label')
+                            if not total_tracks:
+                                total_tracks = api_album.get('total_tracks')
                             if not copyright_text:
                                 api_copyrights = api_album.get('copyrights', [])
                                 copyright_text = ', '.join([c.get('text') for c in api_copyrights if c.get('text')]) if api_copyrights else None
@@ -2130,16 +2148,21 @@ class SpotifyAPI:
                         label = cp_text.strip()
                         self.logger.info(f"Extracted Label from Copyright: '{label}'")
 
+            # Fetch Credits (Composers/Writers)
+            composers = self._get_track_credits(track_id)
+            
             tags_obj = Tags(
                 album_artist=artist_names, # Use track artists as fallback
+                composer=composers,
                 track_number=str(track_number) if track_number is not None else None,
-                total_tracks=None,
+                total_tracks=total_tracks,
                 disc_number=str(disc_number) if disc_number is not None else None,
                 release_date=album_release_date_str,
                 isrc=isrc,
                 upc=upc,
                 label=label,
                 copyright=copyright_text,
+                track_url=f"https://open.spotify.com/track/{track_id}"
             )
             
             # Determine initial metadata for the UI logs based on requested quality
@@ -2382,6 +2405,38 @@ class SpotifyAPI:
             self.logger.error(f"Unexpected error in get_album_info for {album_id}: {e}", exc_info=True)
             raise SpotifyApiError(f"An unexpected error occurred while fetching album {album_id}: {e}")
 
+    def _get_track_credits(self, track_id: str) -> Optional[List[str]]:
+        """
+        Fetches track credits (writers/composers) from Spotify's internal GraphQL API.
+        """
+        try:
+            credits_data = self.embed_client.get_track_credits(track_id)
+            
+            track_union = credits_data.get('trackUnion', {})
+            credits_obj = track_union.get('credits', {})
+            role_credits = credits_obj.get('items', [])
+            
+            writers = []
+            for role in role_credits:
+                role_title = role.get('role', '').lower()
+                # "Writer" usually covers composers and lyricists on Spotify
+                if 'writer' in role_title or 'composer' in role_title:
+                    artists = role.get('artists', [])
+                    for artist in artists:
+                        name = artist.get('name')
+                        if name and name not in writers:
+                            writers.append(name)
+            
+            if writers:
+                self.logger.info(f"Successfully retrieved writers for {track_id} via GraphQL: {writers}")
+                return writers
+                
+            return None
+            
+        except Exception as e:
+            self.logger.warning(f"Error fetching credits for {track_id} via GraphQL: {e}")
+            return None
+
     def get_track_via_librespot(self, track_id: str, quality_tier: QualityEnum = None) -> Optional[TrackInfo]:
         """
         Fallback method to get track info using Librespot (Mercury) when Web API fails.
@@ -2453,6 +2508,7 @@ class SpotifyAPI:
             # Album
             album_name = track_obj.album.name
             album_id = self._gid_to_base62(track_obj.album.gid)
+            total_tracks = getattr(track_obj.album, 'track_count', None)
             
             # Date/Year
             release_year = 0
@@ -2489,10 +2545,10 @@ class SpotifyAPI:
 
             # Tags
             tags_obj = Tags(
-                album_artist=artist_names, # fallback
-                track_number=str(track_obj.number),
-                total_tracks=None, # Not easily available in track obj
-                disc_number=str(track_obj.disc_number),
+                album_artist=artist_names,
+                track_number=track_obj.number,
+                total_tracks=total_tracks,
+                disc_number=track_obj.disc_number,
                 release_date=release_date_str,
                 isrc=isrc,
             )
@@ -3269,6 +3325,7 @@ class SpotifyAPI:
             album_name = show_data.get('name', 'Unknown Show')
             album_id = show_data.get('id', None)
             publisher = show_data.get('publisher', 'Unknown Publisher')
+            total_episodes = show_data.get('total_episodes')
             
             self.logger.debug(f"Show info - Name: {album_name}, Publisher: {publisher}")
             
@@ -3300,6 +3357,8 @@ class SpotifyAPI:
             tags.release_date = release_date
             tags.disc_number = 1
             tags.track_number = 1
+            tags.total_tracks = total_episodes
+            tags.track_url = f"https://open.spotify.com/episode/{episode_id}"
             
             # Create TrackInfo object with episode data
             self.logger.debug("Creating TrackInfo object")

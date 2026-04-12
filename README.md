@@ -14,13 +14,14 @@ A Spotify module for the OrpheusDL modular archival music program
     ```
     git clone https://github.com/bascurtiz/orpheusdl-spotify modules/spotify
     ```
-2.  ```
+2.  Install dependencies:
+    ```
     cd modules/spotify
     pip install --upgrade --ignore-installed -r requirements.txt
     cd..
     cd..
     ```
-2.  Run OrpheusDL once (to allow it to recognize the new module and update its main configuration):
+3.  Run OrpheusDL once (to allow it to recognize the new module and update its main configuration):
     ```
     python orpheus.py
     ```
@@ -30,13 +31,16 @@ A Spotify module for the OrpheusDL modular archival music program
 
 6.  Add Redirect URI: http://127.0.0.1:4381/login
 
-7.  Run a download command with any legit Spotify URL:
+7.  Optional: For FLAC & lyrics, Export as `spotify-cookies.txt`, same method as described for Apple Music (place it in the `/config` folder).
+    Make sure `Spotify.dll` is in root folder next to `orpheus.py`, download [here](https://mega.nz/file/Zdx0FDha#yASfMcAFxqXM9O4yjgqy2-gTZ5qY8DhSb5xsYvlUhsA).
+
+8.  Run a download command with any legit Spotify URL:
     ```
     python orpheus.py https://open.spotify.com/track/1e1JKLEDKP7hEQzJfNAgPl
     ```
     (use `python3` on macOS)
 
-8.  Follow the instructions displayed (it will open up 2 URLs to grant permission/ask to continue in your browser).
+9.  Follow the instructions displayed (it will open up 2 URLs to grant permission/ask to continue in your browser).
 
 ## Configuration
 

@@ -107,8 +107,7 @@ module_information = ModuleInformation(
         "client_id": "",
         "client_secret": "",
         "cookies_path": "",
-        "spotify_dll_path": "",
-        "embed_spotify_lyrics": False
+        "spotify_dll_path": "./Spotify.dll"
     },
     session_settings={},
     module_supported_modes=[
@@ -1262,9 +1261,8 @@ class ModuleInterface:
                         self.logger.warning(f"Could not parse year from album release_date: {album_release_date_full_str}")
                 
                 raw_album_artists = raw_album_data.get('artists', [])
-                if raw_album_artists and isinstance(raw_album_artists, list) and len(raw_album_artists) > 0:
-                    if isinstance(raw_album_artists[0], dict):
-                        primary_album_artist_name_str = raw_album_artists[0].get('name', "Unknown Artist")
+                album_artist_names = [a.get('name') for a in raw_album_artists if isinstance(a, dict) and a.get('name')]
+                primary_album_artist_name_str = album_artist_names[0] if album_artist_names else "Unknown Artist"
 
                 album_images = raw_album_data.get('images', [])
                 if album_images and isinstance(album_images, list) and len(album_images) > 0:
@@ -1538,32 +1536,45 @@ class ModuleInterface:
             return None
 
         # Check if the user enabled spotify lyrics
-        if not self.settings.get('embed_spotify_lyrics', False):
-            if self.debug_mode:
-                self.logger.debug("Spotify lyrics fetching is disabled in settings. Skipping.")
-            return None
 
         cfg = self.spotify_api.config or {}
         sp_dc = None
         cookie_path = cfg.get("cookies_path") or ""
         
+        # Resolve relative path if needed
+        if cookie_path and not os.path.isabs(cookie_path):
+            potential_path = os.path.abspath(os.path.join(project_root, cookie_path))
+            if os.path.exists(potential_path):
+                cookie_path = potential_path
+            elif os.path.exists(os.path.join(os.getcwd(), cookie_path)):
+                cookie_path = os.path.abspath(os.path.join(os.getcwd(), cookie_path))
+
         # Verify that we have an sp_dc cookie to authenticate as WebPlayer
         if cookie_path and os.path.exists(cookie_path):
             try:
-                with open(cookie_path, 'r') as f:
+                with open(cookie_path, 'r', encoding='utf-8', errors='ignore') as f:
                     cookie_text = f.read()
                 for line in cookie_text.splitlines():
-                    if line.startswith('#') or not line.strip():
+                    if not line.strip() or line.startswith('#'):
                         continue
-                    parts = line.strip().split('\t')
-                    if len(parts) >= 7 and parts[5] == 'sp_dc':
+                    parts = line.split('\t')
+                    # Flexible parsing to find sp_dc anywhere in the Netscape format line
+                    if 'sp_dc' in parts:
+                        idx = parts.index('sp_dc')
+                        if idx + 1 < len(parts):
+                            sp_dc = parts[idx + 1]
+                            break
+                    elif len(parts) >= 7 and parts[5] == 'sp_dc':
                         sp_dc = parts[6]
                         break
             except Exception as e:
-                self.logger.error(f"Failed to read sp_dc cookie for lyrics: {e}")
+                self.logger.error(f"Failed to read sp_dc cookie from {cookie_path}: {e}")
+        else:
+            if self.debug_mode:
+                self.logger.debug(f"Spotify cookie path does not exist: {cookie_path}")
 
         if not sp_dc:
-            self.logger.warning("Spotify lyrics fetching requires the sp_dc cookie to authenticate as WebPlayer. Please set cookies_path in settings.")
+            self.logger.warning("Spotify lyrics fetching requires the sp_dc cookie to authenticate as WebPlayer. Please verify cookies_path in settings and ensure the file contains a valid sp_dc cookie.")
             return None
 
         try:

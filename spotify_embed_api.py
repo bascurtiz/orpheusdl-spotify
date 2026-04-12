@@ -29,6 +29,7 @@ PERSISTED_QUERIES = {
     "queryArtistOverview": "446130b4a0aa6522a686aafccddb0ae849165b5e0436fd802f96e0243617b5d8",
     "queryArtistDiscographyAll": "5e07d323febb57b4a56a42abbf781490e58764aa45feb6e3dc0591564fc56599",
     "searchDesktop": "fcad5a3e0d5af727fb76966f06971c19cfa2275e6ff7671196753e008611873c",
+    "getTrackCredits": "78000490a61250280f2c42f0a1c626e255018659d81d2f83d922b947c6a99e4f",
 }
 
 DEFAULT_REQUEST_TIMEOUT = 30  # seconds
@@ -235,6 +236,29 @@ class SpotifyEmbedClient:
         if "data" not in response:
             raise SpotifyEmbedError("Invalid response: missing 'data' field")
         
+        return response["data"]
+
+    def get_track_credits(self, track_id: str) -> Dict[str, Any]:
+        """
+        Fetch credits (writers, producers) for a single track.
+        
+        Args:
+            track_id: Spotify track ID.
+            
+        Returns:
+            Dictionary containing track credits.
+        """
+        self.logger.info(f"Fetching track credits for ID: {track_id}")
+        
+        variables = {
+            "uri": f"spotify:track:{track_id}"
+        }
+        
+        response = self._graphql_query("getTrackCredits", variables)
+        
+        if "data" not in response:
+            raise SpotifyEmbedError("Invalid response: missing 'data' field")
+            
         return response["data"]
     
     def get_album_metadata(self, album_id: str) -> Dict[str, Any]:
