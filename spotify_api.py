@@ -1892,7 +1892,7 @@ Searching and browsing metadata does NOT require authentication.
             from .desktop_api import DesktopSpotifyApi
         except ImportError as e:
             self.logger.error(f"Could not load desktop_api: {e}")
-            raise SpotifyApiError("Desktop API not available. Did you install unplayplay?")
+            raise SpotifyApiError(f"Desktop API not available ({e}). Did you install unplayplay?")
             
         cookie_path = self.config.get("cookies_path")
         dll_path = self.config.get("spotify_dll_path")
