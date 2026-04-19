@@ -1920,7 +1920,12 @@ Searching and browsing metadata does NOT require authentication.
             self.logger.error("No sp_dc cookie found in cookies.txt")
             raise SpotifyApiError("No sp_dc cookie found in cookies.txt. Desktop API requires sp_dc.")
             
+        if not os.path.isfile(dll_path):
+            self.logger.error(f"Spotify.dll not found at: {dll_path}")
+            raise SpotifyApiError(f"Spotify.dll not found at {dll_path}. Lossless downloads require this file.")
+            
         self.logger.info(f"Initializing Desktop API flow for {track_id_base62}...")
+
         try:
             api = DesktopSpotifyApi(sp_dc, dll_path)
             api.authenticate()

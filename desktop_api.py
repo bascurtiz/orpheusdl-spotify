@@ -126,7 +126,10 @@ class DesktopSpotifyApi:
         if not KeyEmu:
             raise RuntimeError("unplayplay is not installed or could not be imported.")
         self.sp_dc = sp_dc
+        if not Path(spotify_dll_path).exists():
+            raise FileNotFoundError(f"Spotify.dll not found at specified path: {spotify_dll_path}")
         self.key_emu = KeyEmu(Path(spotify_dll_path))
+
         import httpx
         # Enforce httpx as Votify's underlying client to prevent TLS fingerprint blocking
         self.client = httpx.Client(timeout=TIMEOUT)
