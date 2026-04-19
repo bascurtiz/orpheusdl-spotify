@@ -296,24 +296,33 @@ class OAuth:
         print()  # Add empty line after authorization messages
         try:
             time.sleep(1.0) # Grace period for HTTP server to stabilize
-            webbrowser.open(auth_url)
-        except Exception as e_wb:
-            self.logger.warning(f"webbrowser.open failed: {e_wb}. Trying os.startfile fallback on Windows...")
-            try:
-                if platform.system() == "Windows":
-                    os.startfile(auth_url)
-                else:
-                    raise
-            except Exception as e_fallback:
-                self.logger.warning(f"os.startfile fallback failed: {e_fallback}. Trying cmd start as final fallback...")
+            
+            # Prioritize os.startfile on Windows as it is more reliable for default browsers
+            opened = False
+            if platform.system() == "Windows":
                 try:
-                    if platform.system() == "Windows":
-                        import subprocess
-                        subprocess.run(["cmd", "/c", "start", "", auth_url], shell=True)
-                    else:
-                        raise
-                except Exception as e_cmd:
-                    self.logger.error(f"Could not open browser automatically: {e_cmd}. Please copy the URL manually.")
+                    os.startfile(auth_url)
+                    opened = True
+                    self.logger.info("Successfully opened browser via os.startfile.")
+                except Exception as e_start:
+                    self.logger.warning(f"os.startfile failed: {e_start}")
+
+            if not opened:
+                try:
+                    webbrowser.open(auth_url)
+                    opened = True
+                except Exception as e_wb:
+                    self.logger.warning(f"webbrowser.open failed: {e_wb}")
+
+            if not opened:
+                # Last resort fallback
+                if platform.system() == "Windows":
+                    import subprocess
+                    subprocess.run(["cmd", "/c", "start", "", auth_url], shell=True)
+                else:
+                    self.logger.error(f"Could not open browser automatically. Please copy the URL manually.")
+        except Exception as e_final:
+            self.logger.error(f"Ultimate failure opening browser: {e_final}")
 
         try:
             self.logger.info("Waiting for user authorization in browser...")
@@ -811,11 +820,14 @@ class SpotifyAPI:
             self.logger.error(f"Unexpected error loading credentials: {e}", exc_info=True)
             return False
 
-    def _perform_oauth_flow(self, save_to_main_file: bool = True) -> bool:
+    def _perform_oauth_flow(self, save_to_main_file: bool = True, is_session_retry: bool = False) -> bool:
         """Performs the full PKCE OAuth flow and optionally saves credentials to the main file."""
         if not self.oauth_handler:
             self.logger.error("OAuth handler not initialized!")
             return False
+        
+        # Reset last attempt URL so we don't return a stale one if things fail early
+        self._last_attempted_auth_url = None
         
         # Check if required credentials are provided before opening browser
         username = (self.config.get('username', '') or '').strip() if self.config else ''
@@ -832,12 +844,10 @@ class SpotifyAPI:
         handler_client_id = self.oauth_handler.client_id if self.oauth_handler else None
         is_official = (handler_client_id == DEVICE_CLIENT_ID or handler_client_id == CLIENT_ID)
         
+        retry_suffix = " (Session Creation Failed)" if is_session_retry else ""
         banner = f"""
 ============================================================
-SPOTIFY AUTHENTICATION REQUIRED
-============================================================
-A browser window will open for Spotify authorization.
-SPOTIFY AUTHENTICATION REQUIRED FOR DOWNLOADS
+SPOTIFY AUTHENTICATION REQUIRED{retry_suffix}
 ============================================================
 A browser window will open for Spotify authorization.
 Please complete the authorization in your browser.
@@ -856,6 +866,9 @@ Searching and browsing metadata does NOT require authentication.
             self.logger.info(f"Proceeding with librespot PKCE OAuth flow ({'Desktop client_id' if handler_client_id == DEVICE_CLIENT_ID else 'Official client_id'}).")
         
         self.logger.info("Starting PKCE OAuth flow...")
+        auth_url = self.oauth_handler.get_authorization_url()
+        self._last_attempted_auth_url = auth_url # Store in main API object for interface.py
+        
         token_data = self.oauth_handler.perform_full_oauth_flow()
 
         if token_data:
@@ -1162,8 +1175,22 @@ Searching and browsing metadata does NOT require authentication.
                 self.logger.info("Successfully created/restored Librespot session.")
                 return True
             else:
-                self.logger.error("Failed to create Librespot session even after obtaining/refreshing credentials.")
-                return False
+                self.logger.error("Failed to create Librespot session with existing/refreshed credentials. Clearing and forcing re-auth.")
+                self._clear_credentials()
+                
+                # Force a retry with full OAuth flow
+                if self._perform_oauth_flow(save_to_main_file=True, is_session_retry=True):
+                    self.librespot_stored_token = self.stored_token
+                    self.stored_token = self.librespot_stored_token # Ensure mapped correctly
+                    if self._create_librespot_session_from_oauth():
+                        self.logger.info("Successfully created Librespot session after recovery re-auth.")
+                        return True
+                    else:
+                        self.logger.error("Second session creation attempt failed after re-auth.")
+                        return False
+                else:
+                    self.logger.error("Re-authentication attempt failed during session recovery.")
+                    return False
 
         except Exception as e:
             self.logger.error(f"Unexpected error during Librespot session initialization: {e}", exc_info=True)
@@ -1596,6 +1623,21 @@ Searching and browsing metadata does NOT require authentication.
                 except Exception as close_err:
                     self.logger.warning(f"Error closing original stream object after saving: {close_err}")
 
+    def is_desktop_api_available(self) -> bool:
+        """Checks if all prerequisites for the Desktop API (Votify) are present."""
+        import os
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+        
+        cookie_path = self.config.get("cookies_path")
+        if not cookie_path:
+            cookie_path = os.path.join(project_root, 'config', 'spotify-cookies.txt')
+            
+        dll_path = self.config.get("spotify_dll_path")
+        if not dll_path:
+            dll_path = os.path.join(project_root, 'Spotify.dll')
+            
+        return os.path.exists(cookie_path) and os.path.exists(dll_path)
+
     def get_track_download(self, **kwargs) -> Optional[TrackDownloadInfo]:
         track_id_base62 = kwargs.get("track_id_str") or kwargs.get("track_id")
         quality_tier = kwargs.get("quality_tier")
@@ -1625,14 +1667,13 @@ Searching and browsing metadata does NOT require authentication.
             if not dll_path:
                 dll_path = os.path.join(project_root, 'Spotify.dll')
                 
-            qt_str = ""
             if hasattr(quality_tier, 'name'):
                 qt_str = quality_tier.name.upper()
             elif isinstance(quality_tier, str):
                 qt_str = quality_tier.upper()
 
             # Check for Desktop API (Votify) prerequisites
-            desktop_api_available = os.path.exists(cookie_path) and os.path.exists(dll_path)
+            desktop_api_available = self.is_desktop_api_available()
             skip_desktop_api = kwargs.get('skip_desktop_api', False)
             
             # Prefer Desktop API flow ONLY for FLAC (as it's optimized for Lossless extraction)
@@ -1897,7 +1938,7 @@ Searching and browsing metadata does NOT require authentication.
 
             if is_flac:
                 # Attempt 24-bit if highest quality requested
-                if qt_str in ["LOSSLESS", "HIFI", "FLAC_24"] and 22 in available_formats:
+                if qt_str in ["HIFI", "FLAC_24"] and 22 in available_formats:
                     stream_info = api.get_track_stream_info(track_id_base62, 22)
                     if stream_info:
                         target_format_id = 22
@@ -2011,11 +2052,16 @@ Searching and browsing metadata does NOT require authentication.
 
     def get_auth_url(self) -> Optional[str]:
         """Returns the last attempted authorization URL."""
+        # Check for explicitly stored URL in main API object first (fixes restoration bug)
+        if hasattr(self, '_last_attempted_auth_url') and self._last_attempted_auth_url:
+            return self._last_attempted_auth_url
+
         if hasattr(self, 'oauth_handler') and self.oauth_handler:
-            # Check for stored URL first to avoid generating a new one with wrong client_id after restoration
+            # Check for stored URL on the handler
             if hasattr(self.oauth_handler, 'last_auth_url') and self.oauth_handler.last_auth_url:
                 return self.oauth_handler.last_auth_url
             return self.oauth_handler.get_authorization_url()
+        return None
         return None
 
     # get_track_by_id removed - replaced by embed_client.get_track_metadata in get_track_info
@@ -2370,7 +2416,7 @@ Searching and browsing metadata does NOT require authentication.
             if qt_str in ["LOSSLESS", "HIFI", "FLAC_24"]:
                 initial_codec = CodecEnum.FLAC
                 initial_bitrate = None
-                if qt_str == "FLAC_24": initial_bit_depth = 24
+                if qt_str in ["HIFI", "FLAC_24"]: initial_bit_depth = 24
             elif qt_str in ["VERY_HIGH", "HIGH"]:
                 initial_bitrate = 320
 

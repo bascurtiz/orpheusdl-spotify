@@ -191,24 +191,15 @@ class ModuleInterface:
                             error_msg = "Spotify username is required for downloading. Please fill in your username in the settings."
                             self.printer.oprint(error_msg)
                         else:
-                            self.printer.oprint("--- Spotify Authentication Error ---")
-                            if last_error:
-                                self.printer.oprint(f"Error: {last_error}")
-                            if last_exit_reason:
-                                self.printer.oprint(f"Exit Reason: {last_exit_reason}")
-                            
                             if auth_url:
                                 self.printer.oprint("\n- ACTION REQUIRED: PROVE YOU ARE A USER -")
-                                self.printer.oprint("1. Select the URL below with your mouse.")
-                                self.printer.oprint("2. Press Ctrl+C on your keyboard to copy it.")
-                                self.printer.oprint("3. Paste it into your web browser and log in.")
-                                self.printer.oprint("\nURL:")
-                                self.printer.oprint(auth_url)
+                                self.printer.oprint("A browser window should have opened automatically to Spotify.")
+                                self.printer.oprint("If it didn't open, please copy/paste the URL below manually:")
+                                self.printer.oprint(f"\nURL: {auth_url}")
                                 self.printer.oprint("\nAfter you see 'Successfully authenticated' in the browser, try this download again.")
                             else:
-                                self.printer.oprint("\nIf you use a custom Client ID, please double check your Client ID, Secret, and Redirect URI.")
-                                self.printer.oprint("Ensure port 4381 is not being used by another application.")
-                            self.printer.oprint("------------------------------------")
+                                self.printer.oprint("Spotify Authentication failed and no authorization URL could be generated.")
+                                self.printer.oprint("Please check your Spotify username in Settings.")
                     self.logged_in = False
                     if self.debug_mode:
                         self.logger.info(f"[{context_message}] _ensure_authenticated returning False (auth_attempt_result was False).")
@@ -911,11 +902,6 @@ class ModuleInterface:
 
 
     def get_track_download(self, track_id: str = None, quality_tier: QualityEnum = None, codec_options: CodecOptions = None, **kwargs) -> Optional[TrackDownloadInfo]:
-        # Ensure authentication before proceeding
-        if not self._ensure_authenticated("get_track_download"):
-            self.logger.warning("Authentication failed in get_track_download, cannot proceed.")
-            return None
-
         # Handle both positional arguments (standard) and kwargs (legacy)
         if track_id is None:
             track_id = kwargs.get("track_id")
@@ -923,6 +909,25 @@ class ModuleInterface:
             quality_tier = kwargs.get("quality_tier")
         if codec_options is None:
             codec_options = kwargs.get("codec_options") or kwargs.get("codec_data")
+            
+        # Determine if Desktop API flow will be used for FLAC
+        # This allows us to skip the browser OAuth flow (Librespot) if only downloading FLAC
+        qt_str = ""
+        if hasattr(quality_tier, 'name'):
+            qt_str = quality_tier.name.upper()
+        elif isinstance(quality_tier, str):
+            qt_str = quality_tier.upper()
+
+        is_flac_requested = (codec_options and hasattr(codec_options, 'codec') and codec_options.codec == CodecEnum.FLAC) or qt_str in ["LOSSLESS", "HIFI", "FLAC_24", "ATMOS"]
+        using_desktop_api = is_flac_requested and self.spotify_api.is_desktop_api_available()
+
+        if using_desktop_api:
+            self.logger.info("Using Desktop API for FLAC download, skipping Librespot session check.")
+        else:
+            # Ensure authentication (Librespot/OAuth) before proceeding for OGG/Episodes
+            if not self._ensure_authenticated("get_track_download"):
+                self.logger.warning("Librespot authentication failed in get_track_download, cannot proceed for non-FLAC track.")
+                return None
             
         track_info = kwargs.get("track_info_obj")
         
