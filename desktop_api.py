@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+from pathlib import Path
 import time
 from urllib.parse import parse_qs
 import requests
@@ -27,12 +28,16 @@ DEVICE_TOKEN_URL = "https://accounts.spotify.com/api/token"
 DEVICE_RESOLVE_URL = "https://accounts.spotify.com/pair/api/resolve"
 DEVICE_CLIENT_ID = "65b708073fc0480ea92a077233ca87bd"
 DEVICE_SCOPE = "app-remote-control,playlist-modify,playlist-modify-private,playlist-modify-public,playlist-read,playlist-read-collaborative,playlist-read-private,streaming,transfer-auth-session,ugc-image-upload,user-follow-modify,user-follow-read,user-library-modify,user-library-read,user-modify,user-modify-playback-state,user-modify-private,user-personalized,user-read-birthdate,user-read-currently-playing,user-read-email,user-read-play-history,user-read-playback-position,user-read-playback-state,user-read-private,user-read-recently-played,user-top-read"
-DEVICE_FLOW_USER_AGENT = "Spotify/126600447 Win32_x86_64/0 (PC laptop)"
-DEVICE_CLIENT_TOKEN = "AAAyQwhc1wWtqYH7spRtLROv2auz6t7xi6xV0OIlc62hyvNrbjR3Lky8Lh2s7fi8jbjX1k31NBQ6d+mpEcAyXCvrNDmZSgTjuJ1QBVzqHOpP5t4E4kDvB36AfvXmcgZltN5dYgbiHal/R2LNupoZvT1fKocen24bUAHsInYgCtKy+kft4OWN1kaFo8LfNZymZzmXBXfxKfCiO1dKBQPz7Rv5hVPpcoyxkfAl4R5aNdap3iuRdAcaB4Udx28Eu98yrA=="
+DEVICE_FLOW_USER_AGENT = "Spotify/128600502 Win32_x86_64/0 (PC desktop)"
+DEVICE_CLIENT_TOKEN = "AADYATyeSD/y5/hrnY8iTzYaPodQdTzz/ffPg5WV8tD5KN53Yi/93r5TSMLRYo4aQCNgzl/1ckCkhFbOjPBWigpOdpvOZxfgJ3mov8/1IBpg05yWPKxwB7xV8SjNIlphPfj9LbrfbLZczrdYD0Wa++z+7sioGtI+m2GcgkOiRQgFqwEn8kP/PkIc/vHADZ1Zs3SZKif+5pXLlJ/0SDr8eZ+xECOXtfCw6jBAkl4r+wOMFrAMmE2JuLGFLg5PDD0="
 
 EXTENDED_METADATA_API_URL = "https://spclient.wg.spotify.com/extended-metadata/v0/extended-metadata"
 AUDIO_STREAM_URLS_API_URL = "https://gue1-spclient.spotify.com/storage-resolve/v2/files/audio/interactive/{format_id}/{file_id}?version=10000000&product=9&platform=39&alt=json"
 PLAYPLAY_LICENSE_API_URL = "https://spclient.wg.spotify.com/playplay/v1/key/{file_id}"
+
+# Decryption IVs
+FLAC_IV = "72e067fbddcbcf77ebe8bc643f630d93"
+OGG_IV  = "00000000000000000000000000000000"
 
 
 class SpotifyDeviceFlow:
@@ -121,7 +126,7 @@ class DesktopSpotifyApi:
         if not KeyEmu:
             raise RuntimeError("unplayplay is not installed or could not be imported.")
         self.sp_dc = sp_dc
-        self.key_emu = KeyEmu(spotify_dll_path)
+        self.key_emu = KeyEmu(Path(spotify_dll_path))
         import httpx
         # Enforce httpx as Votify's underlying client to prevent TLS fingerprint blocking
         self.client = httpx.Client(timeout=TIMEOUT)
@@ -155,8 +160,9 @@ class DesktopSpotifyApi:
             "client-token": DEVICE_CLIENT_TOKEN
         })
 
-    def get_flac_stream_info(self, track_id_base62: str, target_format_id: int):
-        # 16 = FLAC, 22 = FLAC 24-bit
+    def get_track_stream_info(self, track_id_base62: str, target_format_id: int):
+        """Fetches stream URL and file ID for a specific format ID.
+        Common IDs: 16 (FLAC 16-bit), 22 (FLAC 24-bit), 4 (Vorbis 320k), 3 (Vorbis 160k)."""
         request = BatchedEntityRequest(
             header={},
             entity_request=[
@@ -207,11 +213,51 @@ class DesktopSpotifyApi:
         
         return file_id_hex, stream_url
 
+    def get_available_formats(self, track_id_base62: str) -> list[int]:
+        """Returns a list of all available format IDs for a track."""
+        request = BatchedEntityRequest(
+            header={},
+            entity_request=[
+                EntityRequest(
+                    entity_uri=f"spotify:track:{track_id_base62}",
+                    query=[
+                        ExtensionQuery(extension_kind=ExtensionKind.AUDIO_FILES),
+                    ],
+                ),
+            ],
+        )
+        
+        try:
+            response = self.client.post(
+                EXTENDED_METADATA_API_URL,
+                content=request.SerializeToString(),
+                headers={
+                    "Accept": "application/x-protobuf",
+                    "Content-Type": "application/x-protobuf",
+                },
+                timeout=TIMEOUT
+            )
+            response.raise_for_status()
+            
+            extended_metadata = BatchedExtensionResponse()
+            extended_metadata.ParseFromString(response.content)
+            
+            audio_files_ext = next((ext for ext in extended_metadata.extended_metadata if ext.extension_kind == ExtensionKind.AUDIO_FILES), None)
+            if not audio_files_ext:
+                return []
+                
+            audio_files = AudioFilesExtensionResponse()
+            audio_files.ParseFromString(audio_files_ext.extension_data[0].extension_data.value)
+            
+            return [f.file.format for f in audio_files.files]
+        except Exception:
+            return []
+
     def get_playplay_key(self, file_id_hex: str) -> bytes:
         file_id_bytes = bytes.fromhex(file_id_hex)
         request = PlayPlayLicenseRequest(
             version=5,
-            token=PLAYPLAY_TOKEN.VALUE,
+            token=PLAYPLAY_TOKEN,
             interactivity=Interactivity.INTERACTIVE,
             content_type=ContentType.AUDIO_TRACK,
         )
@@ -236,13 +282,14 @@ class DesktopSpotifyApi:
         )
         return bytes(decryption_key)
 
-    def download_and_decrypt(self, stream_url: str, decryption_key: bytes, output_path: str):
+    def download_and_decrypt(self, stream_url: str, decryption_key: bytes, output_path: str, iv_hex: str = FLAC_IV):
+        iv_bytes = bytes.fromhex(iv_hex)
         cipher = AES.new(
             key=decryption_key,
             mode=AES.MODE_CTR,
             counter=Counter.new(
                 128,
-                initial_value=int.from_bytes(bytes.fromhex("72e067fbddcbcf77ebe8bc643f630d93"), "big"),
+                initial_value=int.from_bytes(iv_bytes, "big"),
             ),
         )
         

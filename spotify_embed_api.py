@@ -140,7 +140,7 @@ class SpotifyEmbedClient:
             raise SpotifyEmbedAuthError(f"Failed to fetch embed page: {e}")
     
     def _graphql_query(self, operation_name: str, variables: Dict[str, Any], 
-                       retry_on_auth_error: bool = True) -> Dict[str, Any]:
+                       retry_on_auth_error: bool = True, external_token: Optional[str] = None) -> Dict[str, Any]:
         """
         Execute a GraphQL query against Spotify's internal API.
         
@@ -156,7 +156,7 @@ class SpotifyEmbedClient:
             SpotifyEmbedError: If the query fails.
         """
         # Ensure we have a valid token
-        token = self.get_anonymous_token()
+        token = external_token if external_token else self.get_anonymous_token()
         
         # Get the persisted query hash
         query_hash = PERSISTED_QUERIES.get(operation_name)
@@ -192,7 +192,7 @@ class SpotifyEmbedClient:
             )
             
             # Check for auth errors
-            if response.status_code == 401 and retry_on_auth_error:
+            if response.status_code == 401 and retry_on_auth_error and not external_token:
                 self.logger.warning("GraphQL query returned 401, refreshing token and retrying")
                 # Force refresh token and retry once
                 self.get_anonymous_token(force_refresh=True)
@@ -214,7 +214,7 @@ class SpotifyEmbedClient:
             self.logger.error(f"GraphQL query failed: {e}")
             raise SpotifyEmbedError(f"GraphQL query failed: {e}")
     
-    def get_track_metadata(self, track_id: str) -> Dict[str, Any]:
+    def get_track_metadata(self, track_id: str, external_token: Optional[str] = None) -> Dict[str, Any]:
         """
         Fetch metadata for a single track.
         
@@ -230,7 +230,7 @@ class SpotifyEmbedClient:
             "uri": f"spotify:track:{track_id}"
         }
         
-        response = self._graphql_query("getTrack", variables)
+        response = self._graphql_query("getTrack", variables, external_token=external_token)
         
         # Extract track data from response
         if "data" not in response:
@@ -238,7 +238,7 @@ class SpotifyEmbedClient:
         
         return response["data"]
 
-    def get_track_credits(self, track_id: str) -> Dict[str, Any]:
+    def get_track_credits(self, track_id: str, external_token: Optional[str] = None) -> Dict[str, Any]:
         """
         Fetch credits (writers, producers) for a single track.
         
@@ -254,14 +254,14 @@ class SpotifyEmbedClient:
             "uri": f"spotify:track:{track_id}"
         }
         
-        response = self._graphql_query("getTrackCredits", variables)
+        response = self._graphql_query("getTrackCredits", variables, external_token=external_token)
         
         if "data" not in response:
             raise SpotifyEmbedError("Invalid response: missing 'data' field")
             
         return response["data"]
     
-    def get_album_metadata(self, album_id: str) -> Dict[str, Any]:
+    def get_album_metadata(self, album_id: str, external_token: Optional[str] = None) -> Dict[str, Any]:
         """
         Fetch metadata for an album, including all tracks.
         
@@ -287,7 +287,7 @@ class SpotifyEmbedClient:
             "limit": limit
         }
         
-        response = self._graphql_query("getAlbum", variables)
+        response = self._graphql_query("getAlbum", variables, external_token=external_token)
         
         if "data" not in response or "albumUnion" not in response["data"]:
             raise SpotifyEmbedError("Invalid album response structure")
@@ -321,7 +321,7 @@ class SpotifyEmbedClient:
         
         return response["data"]
     
-    def get_playlist_metadata(self, playlist_id: str) -> Dict[str, Any]:
+    def get_playlist_metadata(self, playlist_id: str, external_token: Optional[str] = None) -> Dict[str, Any]:
         """
         Fetch metadata for a playlist, including all tracks.
         
@@ -346,7 +346,7 @@ class SpotifyEmbedClient:
             "enableWatchFeedEntrypoint": False
         }
         
-        response = self._graphql_query("fetchPlaylist", variables)
+        response = self._graphql_query("fetchPlaylist", variables, external_token=external_token)
         
         if "data" not in response or "playlistV2" not in response["data"]:
             raise SpotifyEmbedError("Invalid playlist response structure")
@@ -380,7 +380,7 @@ class SpotifyEmbedClient:
         
         return response["data"]
     
-    def get_artist_metadata(self, artist_id: str) -> Dict[str, Any]:
+    def get_artist_metadata(self, artist_id: str, external_token: Optional[str] = None) -> Dict[str, Any]:
         """
         Fetch metadata for an artist, including overview and discography.
         
@@ -398,7 +398,7 @@ class SpotifyEmbedClient:
             "locale": ""
         }
         
-        overview_response = self._graphql_query("queryArtistOverview", overview_variables)
+        overview_response = self._graphql_query("queryArtistOverview", overview_variables, external_token=external_token)
         
         if "data" not in overview_response or "artistUnion" not in overview_response["data"]:
             raise SpotifyEmbedError("Invalid artist response structure")
@@ -419,7 +419,7 @@ class SpotifyEmbedClient:
             }
             
             try:
-                discography_response = self._graphql_query("queryArtistDiscographyAll", discography_variables)
+                discography_response = self._graphql_query("queryArtistDiscographyAll", discography_variables, external_token=external_token)
                 
                 discography_data = discography_response.get("data", {}).get("artistUnion", {}).get("discography", {}).get("all", {})
                 items = discography_data.get("items", [])

@@ -179,21 +179,36 @@ class ModuleInterface:
                 
                 if not auth_attempt_result:
                     self.logger.warning(f"[{context_message}] authenticate_stream_api (non-forced) indicated failure. Setting logged_in=False.")
-                    # Check if credentials are missing (should have raised SpotifyConfigError, but handle edge case)
+                    
                     cfg = self.spotify_api.config or {}
                     username = (cfg.get('username') or '').strip()
-                    client_id = (cfg.get('client_id') or '').strip()
-                    client_secret = (cfg.get('client_secret') or '').strip()
-                    missing = []
-                    if not username:
-                        missing.append("username")
-                    if not client_id:
-                        missing.append("client ID")
-                    if not client_secret:
-                        missing.append("client secret")
+                    last_error = self.spotify_api.get_last_error()
+                    last_exit_reason = self.spotify_api.get_last_exit_reason()
+                    auth_url = self.spotify_api.get_auth_url()
+
                     if not silent:
-                        error_msg = "Spotify credentials are required for downloading. Please fill in your username, client ID and secret in the settings."
-                        self.printer.oprint(error_msg)
+                        if not username:
+                            error_msg = "Spotify username is required for downloading. Please fill in your username in the settings."
+                            self.printer.oprint(error_msg)
+                        else:
+                            self.printer.oprint("--- Spotify Authentication Error ---")
+                            if last_error:
+                                self.printer.oprint(f"Error: {last_error}")
+                            if last_exit_reason:
+                                self.printer.oprint(f"Exit Reason: {last_exit_reason}")
+                            
+                            if auth_url:
+                                self.printer.oprint("\n- ACTION REQUIRED: PROVE YOU ARE A USER -")
+                                self.printer.oprint("1. Select the URL below with your mouse.")
+                                self.printer.oprint("2. Press Ctrl+C on your keyboard to copy it.")
+                                self.printer.oprint("3. Paste it into your web browser and log in.")
+                                self.printer.oprint("\nURL:")
+                                self.printer.oprint(auth_url)
+                                self.printer.oprint("\nAfter you see 'Successfully authenticated' in the browser, try this download again.")
+                            else:
+                                self.printer.oprint("\nIf you use a custom Client ID, please double check your Client ID, Secret, and Redirect URI.")
+                                self.printer.oprint("Ensure port 4381 is not being used by another application.")
+                            self.printer.oprint("------------------------------------")
                     self.logged_in = False
                     if self.debug_mode:
                         self.logger.info(f"[{context_message}] _ensure_authenticated returning False (auth_attempt_result was False).")
@@ -894,49 +909,6 @@ class ModuleInterface:
                 print_exc()
         return None
 
-    def _fetch_stream_with_retries(self, track_id_core: str) -> Optional[dict]:
-        """Helper to fetch track stream info with retry logic for librespot errors."""
-        stream_info = None
-        max_retries = 3
-        retry_delay_seconds = 10
-        RATE_LIMIT_BACKOFF_SECONDS = 30
-
-        for attempt in range(max_retries):
-            try:
-                stream_info = self.spotify_api.get_track_stream_info(track_id_core)
-                if self.debug_mode:
-                    logging.debug(f"Successfully received stream_info response for {track_id_core} on attempt {attempt + 1}")
-                return stream_info
-            except SpotifyTrackUnavailableError:
-                raise
-            except SpotifyRateLimitDetectedError as rlde:
-                logging.warning(f"SpotifyRateLimitDetectedError caught directly for {track_id_core} on attempt {attempt + 1}: {rlde}. Re-raising.")
-                raise
-            except SpotifyLibrespotError as lspot_err:
-                error_str = str(lspot_err)
-                
-                if "Failed fetching audio key!" in error_str:
-                    if self.debug_mode:
-                        logging.debug(f"Rate limit indicator (Failed fetching audio key) for track {track_id_core} on attempt {attempt + 1}. Escalating.")
-                    self.printer.oprint(f"[Spotify Rate Limit] Possible rate limit detected (audio key). Waiting for {RATE_LIMIT_BACKOFF_SECONDS} seconds...")
-                    time.sleep(RATE_LIMIT_BACKOFF_SECONDS)
-                    raise SpotifyRateLimitDetectedError(f"Rate limit detected (audio key) for {track_id_core} after attempt {attempt + 1}") from lspot_err
-                
-                # Standard retry for other SpotifyLibrespotError types
-                else:
-                    logging.warning(f"Librespot failed for track {track_id_core} on attempt {attempt + 1}/{max_retries}: {error_str}")
-                    if attempt < max_retries - 1:
-                        logging.warning(f"Retrying (standard librespot error) for {track_id_core} in {retry_delay_seconds} seconds... (Attempt {attempt + 1}/{max_retries})")
-                        time.sleep(retry_delay_seconds)
-                    else:
-                        logging.error(f"Librespot (standard error) failed permanently for track {track_id_core} after {max_retries} attempts: {error_str}")
-                        return None
-            except Exception as get_stream_err:                
-                logging.error(f"Unexpected error calling get_track_stream_info for {track_id_core} on attempt {attempt + 1}: {get_stream_err}", exc_info=True)
-                self.printer.oprint(f"[Spotify Error] Unexpected error getting stream info for track ID core {track_id_core}: {get_stream_err}")
-                return None
-        
-        return stream_info
 
     def get_track_download(self, track_id: str = None, quality_tier: QualityEnum = None, codec_options: CodecOptions = None, **kwargs) -> Optional[TrackDownloadInfo]:
         # Ensure authentication before proceeding
@@ -984,6 +956,9 @@ class ModuleInterface:
             try:
                 return self.spotify_api.get_track_download(**kwargs)
             except SpotifyTrackUnavailableError as track_error:
+                if "Spotify Premium is required" in str(track_error):
+                    self.logger.warning(f"Aborting episode fallback: {track_error}")
+                    raise track_error
                 # If track download fails, try as episode
                 self.logger.info(f"Track download failed for {track_id}, trying as episode: {track_error}")
                 try:
