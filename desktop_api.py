@@ -279,11 +279,21 @@ class DesktopSpotifyApi:
         license_resp = PlayPlayLicenseResponse()
         license_resp.ParseFromString(response.content)
         
+        # MOMENT OF DEATH MARKER
+        import sys as _sys
+        _sys.__stdout__.write("\n[DEBUG] [MOMENT OF DEATH] About to enter KeyEmu.get_aes_key()...\n")
+        _sys.__stdout__.flush()
+
         decryption_key = self.key_emu.get_aes_key(
             obfuscated_key=license_resp.obfuscated_key,
             content_id=file_id_bytes[: EMULATOR_SIZES.CONTENT_ID],
         )
+
+        _sys.__stdout__.write("[DEBUG] [MOMENT OF DEATH] Successfully returned from KeyEmu.get_aes_key()\n")
+        _sys.__stdout__.flush()
+
         return bytes(decryption_key)
+
 
     def download_and_decrypt(self, stream_url: str, decryption_key: bytes, output_path: str, iv_hex: str = FLAC_IV):
         iv_bytes = bytes.fromhex(iv_hex)
