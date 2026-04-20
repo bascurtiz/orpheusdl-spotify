@@ -1924,16 +1924,6 @@ Searching and browsing metadata does NOT require authentication.
             self.logger.error(f"Spotify.dll not found at: {dll_path}")
             raise SpotifyApiError(f"Spotify.dll not found at {dll_path}. Lossless downloads require this file.")
             
-        # DLL Metadata Diagnostics (High Priority)
-        try:
-            import hashlib
-            file_size = os.path.getsize(dll_path)
-            with open(dll_path, "rb") as f:
-                md5_hash = hashlib.md5(f.read()).hexdigest()
-            known_good = "374c7c01b5547ffef8c0f538ef22d7ca"
-            match_status = "MATCH" if md5_hash == known_good else f"MISMATCH (Expected: {known_good})"
-
-        except Exception as diag_err:
 
 
         self.logger.debug(f"Initializing Desktop API flow for {track_id_base62}...")
