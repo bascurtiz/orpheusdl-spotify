@@ -296,26 +296,25 @@ class DesktopSpotifyApi:
         with self._emu_lock:
             # Determine path to worker script
             if getattr(sys, 'frozen', False):
-                # PyInstaller bundled path
-                base_path = Path(sys._MEIPASS)
-                worker_path = base_path / "modules" / "spotify" / "decrypt_worker.py"
+                # In frozen app, we use sys.executable with a worker flag
+                cmd = [sys.executable, "--spotify-decrypt-worker"]
             else:
-                # Source path
+                # In development, we use sys.executable (usually python.exe) with the worker script path
                 worker_path = Path(__file__).parent / "decrypt_worker.py"
+                if not worker_path.exists():
+                    raise FileNotFoundError(f"Decryption worker not found at {worker_path}")
+                cmd = [sys.executable, str(worker_path)]
 
-            if not worker_path.exists():
-                raise FileNotFoundError(f"Decryption worker not found at {worker_path}")
-
-            # Call the system Python to execute the worker
+            # Call the worker (either via script or the app itself in worker mode)
             try:
+                cmd.extend([
+                    str(self.spotify_dll_path),
+                    license_resp.obfuscated_key.hex(),
+                    file_id_hex
+                ])
+                
                 result = subprocess.check_output(
-                    [
-                        "python",
-                        str(worker_path),
-                        str(self.spotify_dll_path),
-                        license_resp.obfuscated_key.hex(),
-                        file_id_hex
-                    ],
+                    cmd,
                     stderr=subprocess.STDOUT,
                     creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
                 )
