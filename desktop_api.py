@@ -11,6 +11,10 @@ from Crypto.Util import Counter
 from .proto.extendedmetadata_pb2 import BatchedEntityRequest, BatchedExtensionResponse, EntityRequest, ExtensionQuery, ExtensionKind
 from .proto.playplay_pb2 import PlayPlayLicenseRequest, PlayPlayLicenseResponse, Interactivity, ContentType
 from .proto.audio_files_extension_pb2 import AudioFilesExtensionResponse
+import subprocess
+import binascii
+import sys
+import os
 
 try:
     from unplayplay.key_emu import KeyEmu
@@ -123,12 +127,18 @@ class SpotifyDeviceFlow:
 
 class DesktopSpotifyApi:
     def __init__(self, sp_dc: str, spotify_dll_path: str):
-        if not KeyEmu:
-            raise RuntimeError("unplayplay is not installed or could not be imported.")
         self.sp_dc = sp_dc
+        self.spotify_dll_path = spotify_dll_path
         if not Path(spotify_dll_path).exists():
             raise FileNotFoundError(f"Spotify.dll not found at specified path: {spotify_dll_path}")
-        self.key_emu = KeyEmu(Path(spotify_dll_path))
+        
+        # Don't initialize KeyEmu directly if we are likely to use the bridge
+        self.key_emu = None
+        if not getattr(sys, 'frozen', False):
+            try:
+                self.key_emu = KeyEmu(Path(spotify_dll_path))
+            except Exception as e:
+                logger.warning(f"Could not initialize local KeyEmu: {e}. Will fall back to Python Bridge.")
 
         import httpx
         # Enforce httpx as Votify's underlying client to prevent TLS fingerprint blocking
@@ -153,6 +163,8 @@ class DesktopSpotifyApi:
         })
         self.client.cookies.set("sp_dc", sp_dc, domain=".spotify.com")
         self._access_token = None
+        import threading
+        self._emu_lock = threading.Lock()
         
     def authenticate(self):
         flow = SpotifyDeviceFlow(self.sp_dc)
@@ -279,19 +291,50 @@ class DesktopSpotifyApi:
         license_resp = PlayPlayLicenseResponse()
         license_resp.ParseFromString(response.content)
         
-        # MOMENT OF DEATH MARKER (High Priority Print)
-        print(f"\n[DEBUG] [MOMENT OF DEATH] About to enter KeyEmu.get_aes_key()...\n"
-              f"  - Content ID (partial): {file_id_bytes[:4].hex()}...\n"
-              f"  - KeyEmu Object: {self.key_emu}", flush=True)
 
-        decryption_key = self.key_emu.get_aes_key(
-            obfuscated_key=license_resp.obfuscated_key,
-            content_id=file_id_bytes[: EMULATOR_SIZES.CONTENT_ID],
-        )
 
-        print("[DEBUG] [MOMENT OF DEATH] Successfully returned from KeyEmu.get_aes_key()", flush=True)
+        with self._emu_lock:
+            # Determine path to worker script
+            if getattr(sys, 'frozen', False):
+                # PyInstaller bundled path
+                base_path = Path(sys._MEIPASS)
+                worker_path = base_path / "modules" / "spotify" / "decrypt_worker.py"
+            else:
+                # Source path
+                worker_path = Path(__file__).parent / "decrypt_worker.py"
 
-        return bytes(decryption_key)
+            if not worker_path.exists():
+                raise FileNotFoundError(f"Decryption worker not found at {worker_path}")
+
+            # Call the system Python to execute the worker
+            try:
+                result = subprocess.check_output(
+                    [
+                        "python",
+                        str(worker_path),
+                        str(self.spotify_dll_path),
+                        license_resp.obfuscated_key.hex(),
+                        file_id_hex
+                    ],
+                    stderr=subprocess.STDOUT,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                )
+                
+                output = json.loads(result.decode())
+                if "error" in output:
+                    raise RuntimeError(f"Worker Error: {output['error']}\n{output.get('traceback', '')}")
+                
+                decryption_key = binascii.unhexlify(output["key"])
+
+                return decryption_key
+
+            except subprocess.CalledProcessError as e:
+                error_msg = e.output.decode() if e.output else str(e)
+                logger.error(f"Python Bridge failed: {error_msg}")
+                raise RuntimeError(f"Python Bridge failed to execute: {error_msg}")
+            except Exception as e:
+                logger.error(f"Failed to call Python Bridge: {e}")
+                raise
 
 
 

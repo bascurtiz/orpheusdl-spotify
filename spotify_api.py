@@ -1932,14 +1932,11 @@ Searching and browsing metadata does NOT require authentication.
                 md5_hash = hashlib.md5(f.read()).hexdigest()
             known_good = "374c7c01b5547ffef8c0f538ef22d7ca"
             match_status = "MATCH" if md5_hash == known_good else f"MISMATCH (Expected: {known_good})"
-            print(f"\n[DIAGNOSTIC] Spotify.dll verification:\n"
-                  f"  - Path: {dll_path}\n"
-                  f"  - Size: {file_size} bytes\n"
-                  f"  - MD5: {md5_hash} ({match_status})", flush=True)
-        except Exception as diag_err:
-            print(f"\n[DIAGNOSTIC] Failed to get Spotify.dll metadata: {diag_err}", flush=True)
 
-        self.logger.info(f"Initializing Desktop API flow for {track_id_base62}...")
+        except Exception as diag_err:
+
+
+        self.logger.debug(f"Initializing Desktop API flow for {track_id_base62}...")
 
 
 
@@ -1956,7 +1953,7 @@ Searching and browsing metadata does NOT require authentication.
             
             # Fetch all available format IDs to pick the best one
             available_formats = api.get_available_formats(track_id_base62)
-            self.logger.info(f"Available format IDs for track: {available_formats}")
+            self.logger.debug(f"Available format IDs for track: {available_formats}")
 
             if is_flac:
                 # Attempt 24-bit if highest quality requested
@@ -1964,13 +1961,13 @@ Searching and browsing metadata does NOT require authentication.
                     stream_info = api.get_track_stream_info(track_id_base62, 22)
                     if stream_info:
                         target_format_id = 22
-                        self.logger.info("Found FLAC 24-bit stream!")
+                        self.logger.debug("Found FLAC 24-bit stream!")
                 
                 if not stream_info and 16 in available_formats:
                     stream_info = api.get_track_stream_info(track_id_base62, 16)
                     target_format_id = 16
                     if stream_info:
-                        self.logger.info("Found standard FLAC stream!")
+                        self.logger.debug("Found standard FLAC stream!")
             else:
                 # OGG/VORBIS Mapping with smart fallback
                 preferred_ids = []
@@ -1985,7 +1982,7 @@ Searching and browsing metadata does NOT require authentication.
                 target_format_id = next((fid for fid in preferred_ids if fid in available_formats), None)
                 
                 if target_format_id:
-                    self.logger.info(f"Selected format ID {target_format_id} based on availability and preference ({qt_str}).")
+                    self.logger.debug(f"Selected format ID {target_format_id} based on availability and preference ({qt_str}).")
                     stream_info = api.get_track_stream_info(track_id_base62, target_format_id)
                 
             if not stream_info:
@@ -1999,7 +1996,7 @@ Searching and browsing metadata does NOT require authentication.
             final_codec = CodecEnum.FLAC if target_format_id in [16, 22] else CodecEnum.VORBIS
             file_extension = ".flac" if final_codec == CodecEnum.FLAC else ".ogg"
             
-            self.logger.info(f"Decrypting and downloading {final_codec.name} stream ID: {file_id_hex}")
+            self.logger.debug(f"Decrypting and downloading {final_codec.name} stream ID: {file_id_hex}")
             decryption_key = api.get_playplay_key(file_id_hex)
             
             import tempfile
