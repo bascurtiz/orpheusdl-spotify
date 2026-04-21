@@ -2262,7 +2262,27 @@ Searching and browsing metadata does NOT require authentication.
                 if a_id:
                     artist_ids.append(a_id)
             
+            track_union = track_data_graphql.get('trackUnion', {})
+        
+            # Determine album ID for full metadata fetch
+            album_id_fetch = None
+            album_uri = track_union.get('albumOfTrack', {}).get('uri')
+            if album_uri:
+                parts = album_uri.split(':')
+                if len(parts) > 2:
+                    album_id_fetch = parts[2]
+            
             album_data = track_union.get('albumOfTrack', {})
+            if album_id_fetch:
+                try:
+                    # Fetch full album metadata to get disc numbers which are missing in getTrack response
+                    full_album_data = self.embed_client.get_album_metadata(album_id_fetch)
+                    if full_album_data:
+                        # Extract albumUnion which containing the full metadata
+                        album_data = full_album_data.get('albumUnion', {})
+                        self.logger.debug(f"Using full album metadata for disc info (ID: {album_id_fetch})")
+                except Exception as e:
+                    self.logger.warning(f"Failed to fetch full album metadata for disc info: {e}")
             album_name = album_data.get('name')
             
             # Extract Label, Copyrights, and UPC from albumOfTrack if available
@@ -2298,9 +2318,30 @@ Searching and browsing metadata does NOT require authentication.
             track_number = track_union.get('trackNumber')
             disc_number = track_union.get('discNumber')
             
-            # Get total tracks from album metadata in GraphQL
+            # Get total tracks/discs from album metadata in GraphQL
             album_tracks_obj = album_data.get('tracks') or album_data.get('tracksV2', {})
             total_tracks = album_tracks_obj.get('totalCount')
+
+            # Calculate total discs and find current track's disc number from album items
+            total_discs = 0
+            if items := album_tracks_obj.get('items', []):
+                for item in items:
+                    track_item = item.get('track', item)
+                    d_num = track_item.get('discNumber')
+                    if d_num:
+                        if d_num > total_discs:
+                            total_discs = d_num
+                        
+                        # If disc_number was missing from track_union, try to find it here
+                        t_uri = track_item.get('uri')
+                        if t_uri and track_id in t_uri and disc_number is None:
+                            disc_number = d_num
+            
+            if total_discs == 0:
+                total_discs = 1 if disc_number else None
+            
+            # Cleanup debug prints if they were added
+            # (I'll remove the ones I added earlier)
             
             # Explicit content check
             explicit = track_union.get('contentRating', {}).get('label') == 'EXPLICIT'
@@ -2399,9 +2440,10 @@ Searching and browsing metadata does NOT require authentication.
             tags_obj = Tags(
                 album_artist=artist_names, # Use track artists as fallback
                 composer=composers,
-                track_number=str(track_number) if track_number is not None else None,
+                track_number=track_number,
                 total_tracks=total_tracks,
-                disc_number=str(disc_number) if disc_number is not None else None,
+                disc_number=disc_number,
+                total_discs=total_discs,
                 release_date=album_release_date_str,
                 isrc=isrc,
                 upc=upc,
