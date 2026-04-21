@@ -319,7 +319,17 @@ class DesktopSpotifyApi:
                     creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
                 )
                 
-                output = json.loads(result.decode())
+                out_str = result.decode('utf-8', 'ignore').strip()
+                try:
+                    # In case other modules printed to stdout, try to extract just the last line
+                    if '\n' in out_str:
+                        last_line = out_str.splitlines()[-1].strip()
+                        output = json.loads(last_line)
+                    else:
+                        output = json.loads(out_str)
+                except ValueError as json_err:
+                    raise RuntimeError(f"Worker output was not valid JSON. Raw output: {out_str}")
+                    
                 if "error" in output:
                     raise RuntimeError(f"Worker Error: {output['error']}\n{output.get('traceback', '')}")
                 
