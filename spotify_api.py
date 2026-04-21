@@ -427,8 +427,6 @@ class PkceTokenDetails: # Simplified for current use if only access_token is man
         self.issued_at = issued_at if issued_at is not None else int(time.time())
 
     def is_expired(self, margin_seconds=60) -> bool:
-        if not self.access_token or self.issued_at is None or self.expires_in is None:
-            return True
         return (self.issued_at + self.expires_in - margin_seconds) < time.time()
 
 class StoredToken: 
@@ -456,88 +454,6 @@ class StoredToken:
     @classmethod
     def from_dict(cls, data: dict) -> 'StoredToken':
         return cls(data)
-
-# --- Custom Token Provider for Librespot (REINSTATING THIS SECTION) --- 
-class LibrespotStoredTokenAdapter(LibrespotTokenProvider.StoredToken):
-    """Adapts our StoredToken to what LibrespotTokenProvider.StoredToken expects."""
-    def __init__(self, our_stored_token: StoredToken, logger_instance=None):
-        self.logger = logger_instance if logger_instance else logging.getLogger(__name__ + ".LibrespotStoredTokenAdapter")
-        if not our_stored_token:
-            self.logger.error("CRITICAL_ADAPTER: our_stored_token is None during LibrespotStoredTokenAdapter init!")
-            raise ValueError("our_stored_token cannot be None for LibrespotStoredTokenAdapter")
-        
-        self.timestamp = int(our_stored_token.timestamp / 1000) # Librespot expects seconds
-        self.expires_in = our_stored_token.expires_in
-        self.access_token = our_stored_token.access_token
-        self.scopes = our_stored_token.scopes
-        self.logger.debug(f"CRITICAL_ADAPTER: LibrespotStoredTokenAdapter initialized. AccessToken: {self.access_token[:20]}..., Timestamp (s): {self.timestamp}, ExpiresIn: {self.expires_in}")        
-
-class SpotifyApiTokenProvider(LibrespotTokenProvider):
-    """Custom TokenProvider that uses the OAuth token managed by SpotifyAPI."""
-    _instance_counter = 0 # Class variable to count instances
-
-    def __init__(self, session, spotify_api_instance: 'SpotifyAPI'):
-        super().__init__(session) # Calls LibrespotTokenProvider.__init__(session)
-        SpotifyApiTokenProvider._instance_counter += 1
-        self.instance_id = SpotifyApiTokenProvider._instance_counter
-        self._spotify_api_ref = weakref.ref(spotify_api_instance) 
-        
-        self.logger = spotify_api_instance.logger if spotify_api_instance else logging.getLogger(__name__ + ".SpotifyApiTokenProvider")
-        self.logger.info(f"CUSTOM_TP_DEBUG (Instance {self.instance_id}): SpotifyApiTokenProvider initialized. Bound to SpotifyAPI ID: {id(spotify_api_instance)}, Librespot Session ID: {id(session)}")
-        if spotify_api_instance: # ensure instance exists before trying to set attribute
-            spotify_api_instance.last_custom_provider_id_created = self.instance_id
-
-    def get_token(self, *scopes: str) -> _OriginalLibrespotTokenProvider.StoredToken:
-        """
-        Called by Librespot components when they need a token for the given scopes.
-        Following Zotify's approach: return the OAuth token directly instead of 
-        trying to fetch from keymaster.
-        """
-        spotify_api = self._spotify_api_ref()
-        self.logger.info(f"CUSTOM_TP_DEBUG (Instance {self.instance_id}, API: {id(spotify_api)}): get_token CALLED for scopes: {scopes}")
-
-        if not spotify_api or not hasattr(spotify_api, 'stored_token') or not spotify_api.stored_token:
-            self.logger.error(f"CUSTOM_TP_DEBUG (Instance {self.instance_id}): SpotifyAPI instance or its stored_token is not available. Raising AuthError.")
-            raise Exception("SpotifyAPI instance or stored_token not available") 
-
-        pkce_token_info = spotify_api.stored_token
-        if not pkce_token_info.access_token:
-            self.logger.error(f"CUSTOM_TP_DEBUG (Instance {self.instance_id}): PKCE access_token is missing from SpotifyAPI.stored_token.")
-            raise Exception("PKCE access_token is missing")
-
-        self.logger.info(f"CUSTOM_TP_DEBUG (Instance {self.instance_id}): Returning OAuth token directly for scopes {' '.join(scopes)} (Zotify approach)")
-
-        # CRITICAL: Check if token is expired and refresh if necessary
-        if pkce_token_info.expired():
-            self.logger.info(f"CUSTOM_TP_DEBUG (Instance {self.instance_id}): Token is expired, attempting refresh in provider...")
-            try:
-                # We need to call the API instance's refresh logic
-                # However, the OAuth handler might be None if not initialized
-                if spotify_api.librespot_oauth_handler:
-                    refreshed_data = spotify_api.librespot_oauth_handler.refresh_access_token(pkce_token_info.refresh_token)
-                    if refreshed_data:
-                        pkce_token_info = StoredToken(refreshed_data)
-                        spotify_api.stored_token = pkce_token_info
-                        self.logger.info(f"CUSTOM_TP_DEBUG (Instance {self.instance_id}): Successfully refreshed token in provider.")
-                        # Optionally save it
-                        spotify_api._save_credentials(pkce_token_info, spotify_api.librespot_session.username() if spotify_api.librespot_session else "PKCE_USER")
-            except Exception as e_ref:
-                self.logger.error(f"CUSTOM_TP_DEBUG (Instance {self.instance_id}): Failed to refresh token in provider: {e_ref}")
-
-        # Create a response that mimics what keymaster would return        
-        oauth_token_response = {
-            "accessToken": pkce_token_info.access_token,
-            "expiresIn": pkce_token_info.expires_in,
-            "scope": list(scopes)  # Use the requested scopes
-        }
-
-        self.logger.info(f"CUSTOM_TP_DEBUG (Instance {self.instance_id}): Created token response for scopes {' '.join(scopes)}")
-        
-        try:
-            return _OriginalLibrespotTokenProvider.StoredToken(oauth_token_response)
-        except Exception as e:
-            self.logger.error(f"CUSTOM_TP_DEBUG (Instance {self.instance_id}): Error creating StoredToken: {e}", exc_info=True)
-            raise
 
 class LibrespotAudioKeyFilter(logging.Filter):
     """Filter to suppress noisy librespot audio key error messages and rate limit warnings"""
@@ -927,29 +843,6 @@ Searching and browsing metadata does NOT require authentication.
 
         self.logger.info(f"Attempting to create librespot session for user: '{spotify_username_for_librespot}' using OAuth token.")
 
-        # --- Setup Temporary Global librespot.core.TokenProvider Patch (Closure-based) ---
-        current_spotify_api_instance_ref = weakref.ref(self)
-
-        def temporary_token_provider_factory_for_patch(session_instance_for_provider, *args_passed_by_librespot, **kwargs_passed_by_librespot):
-            api_instance = current_spotify_api_instance_ref()
-            if api_instance:
-                api_instance.logger.info(f"GLOBAL_PATCH_DEBUG: temporary_token_provider_factory called. SpotifyAPI ID: {id(api_instance)}.")
-                provider = SpotifyApiTokenProvider(session_instance_for_provider, api_instance) # Pass api_instance (SpotifyAPI)
-                return provider
-            else:
-                # This path should ideally not be hit if SpotifyAPI instance is managed correctly.
-                logging.getLogger(__name__).error("GLOBAL_PATCH_DEBUG: temporary_token_provider_factory: SpotifyAPI weak_ref is dead! Cannot create custom provider.")
-                return _OriginalLibrespotTokenProvider(session_instance_for_provider, *args_passed_by_librespot, **kwargs_passed_by_librespot)
-
-        # Store the truly original one if we haven't for this whole module load        
-        if not hasattr(librespot.core, '_truly_original_token_provider_for_restore'):
-            librespot.core._truly_original_token_provider_for_restore = librespot.core.TokenProvider # Store current before patch
-            self.logger.info(f"GLOBAL_PATCH_DEBUG: Stored _truly_original_token_provider_for_restore (was: {librespot.core._truly_original_token_provider_for_restore}).")
-        
-        # Apply the patch
-        librespot.core.TokenProvider = temporary_token_provider_factory_for_patch
-        self.logger.info(f"GLOBAL_PATCH_DEBUG: Applied temporary global patch. librespot.core.TokenProvider is now: {librespot.core.TokenProvider}")        
-
         try:
             conf_builder = LibrespotSession.Configuration.Builder()
             conf_builder.set_store_credentials(False) 
@@ -978,18 +871,6 @@ Searching and browsing metadata does NOT require authentication.
 
             if self.librespot_session:
                 self.logger.info(f"Librespot session created successfully. Username: {self.librespot_session.username()}. Device ID: {self.librespot_session.device_id()}")
-                
-                actual_provider = self.librespot_session.tokens() # type: ignore
-                self.logger.info(f"DIAGNOSTIC: Librespot session's internal token provider type: {type(actual_provider)}")
-                if isinstance(actual_provider, SpotifyApiTokenProvider):
-                    self.logger.info(f"  It IS SpotifyApiTokenProvider (Instance ID: {actual_provider.instance_id})")
-                    bound_api_instance = actual_provider._spotify_api_ref() if hasattr(actual_provider, '_spotify_api_ref') else None
-                    if bound_api_instance and id(self) == id(bound_api_instance):
-                         self.logger.info(f"  And it's bound to the correct SpotifyAPI instance ({id(self)}).")
-                    else:
-                         self.logger.error(f"  BUT it's bound to a DIFFERENT/DEAD SpotifyAPI instance (Provider's ref: {id(bound_api_instance) if bound_api_instance else 'N/A'})!")
-                else:
-                    self.logger.warning(f"  It is NOT SpotifyApiTokenProvider, it is {type(actual_provider)}.")
 
                 # Test with a simple API call that requires a token, made via Librespot's mechanisms
                 try:                    
@@ -1015,21 +896,13 @@ Searching and browsing metadata does NOT require authentication.
             return False
 
         except MercuryClient.MercuryException as me:
-            self.logger.error(f"GLOBAL_PATCH_DEBUG: MercuryException during builder.create(): {me}", exc_info=True)
+            self.logger.error(f"MercuryException during builder.create(): {me}", exc_info=True)
             self.librespot_session = None # Clear session on error
             return False
         except Exception as e:
-            self.logger.error(f"GLOBAL_PATCH_DEBUG: Unexpected generic exception during Librespot session creation: {e}", exc_info=True)
+            self.logger.error(f"Unexpected generic exception during Librespot session creation: {e}", exc_info=True)
             self.librespot_session = None # Clear session on error
             return False
-        finally:
-            # --- Restore Original Global librespot.core.TokenProvider ---
-            if hasattr(librespot.core, '_truly_original_token_provider_for_restore'):
-                librespot.core.TokenProvider = librespot.core._truly_original_token_provider_for_restore
-                self.logger.info(f"GLOBAL_PATCH_DEBUG: Restored original librespot.core.TokenProvider from _truly_original_token_provider_for_restore. It is now: {librespot.core.TokenProvider}")
-            else:
-                self.logger.warning("GLOBAL_PATCH_DEBUG: _truly_original_token_provider_for_restore not found. Original may not have been stored or patch was bypassed.")
-            self.logger.info("GLOBAL_PATCH_DEBUG: Librespot session creation attempt finished.")
         
         return False
 
@@ -1137,12 +1010,6 @@ Searching and browsing metadata does NOT require authentication.
             self.logger.error(error_msg)
             raise SpotifyConfigError(error_msg)
         
-        # USE HYBRID FILE PATH AND HANDLER
-        original_oauth_handler = self.oauth_handler
-        self.oauth_handler = self.librespot_oauth_handler
-        original_file_path = self.credentials_file_path
-        self.credentials_file_path = self.librespot_credentials_file_path
-        
         try:
             librespot_loaded = False
             credentials_existed = os.path.exists(self.credentials_file_path)
@@ -1196,9 +1063,7 @@ Searching and browsing metadata does NOT require authentication.
             self.logger.error(f"Unexpected error during Librespot session initialization: {e}", exc_info=True)
             return False
         finally:
-            # Always restore original handler and path to avoid side effects on Web API operations
-            self.oauth_handler = original_oauth_handler
-            self.credentials_file_path = original_file_path
+            pass
 
     def _is_session_valid(self, session_obj: Optional[LibrespotSession]) -> bool:
         """Checks if the provided librespot session object is considered valid."""
