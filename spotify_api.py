@@ -620,7 +620,7 @@ class SpotifyAPI:
         full_token_details_for_storage = token_obj.to_dict()
         full_token_details_for_storage['spotify_username'] = username # Store the username we got/used
         # Store the client_id used for this token so we can detect if it changed
-        full_token_details_for_storage['client_id'] = self.oauth_handler.client_id if self.oauth_handler else None
+        full_token_details_for_storage['client_id'] = self.librespot_oauth_handler.client_id if self.librespot_oauth_handler else None
 
         try:
             # First, save the full token details (this is the primary credentials file now)
@@ -645,7 +645,7 @@ class SpotifyAPI:
             
             # Check if client_id has changed - if so, we need to re-authenticate with new credentials
             stored_client_id = token_data_from_file.get('client_id')
-            current_client_id = self.oauth_handler.client_id if self.oauth_handler else None
+            current_client_id = self.librespot_oauth_handler.client_id if self.librespot_oauth_handler else None
             
             # If no client_id is stored, it's from the old Desktop client_id (before we added this feature)
             # If we now have a custom client_id, we need to re-authenticate
@@ -699,14 +699,14 @@ class SpotifyAPI:
                         self.logger.error(f"Error removing credentials file: {e_rm}")
                     return False
                 
-                refreshed_token_data = self.oauth_handler.refresh_access_token(loaded_token.refresh_token)
+                refreshed_token_data = self.librespot_oauth_handler.refresh_access_token(loaded_token.refresh_token)
                 if refreshed_token_data:
                     self.stored_token = StoredToken(refreshed_token_data)
                     # Save the refreshed token
                     try:
                         token_dict = self.stored_token.to_dict()
                         token_dict['spotify_username'] = token_data_from_file.get('spotify_username', 'PKCE_USER')
-                        token_dict['client_id'] = self.oauth_handler.client_id if self.oauth_handler else None
+                        token_dict['client_id'] = self.librespot_oauth_handler.client_id if self.librespot_oauth_handler else None
                         with open(self.credentials_file_path, 'w') as f:
                             json.dump(token_dict, f, indent=4)
                         self.logger.info("Successfully refreshed and saved token.")
@@ -715,7 +715,7 @@ class SpotifyAPI:
                     self.logger.info("Successfully refreshed and loaded token.")
                     return True # Librespot session will be created next
                 else:
-                    error_msg = self.oauth_handler.error_message if self.oauth_handler else "Unknown error"
+                    error_msg = self.librespot_oauth_handler.error_message if self.librespot_oauth_handler else "Unknown error"
                     self.logger.warning(f"Failed to refresh token: {error_msg}. Full re-authentication required.")
                     # Delete the invalid credentials file to force re-authentication
                     try:
@@ -738,7 +738,7 @@ class SpotifyAPI:
 
     def _perform_oauth_flow(self, save_to_main_file: bool = True, is_session_retry: bool = False) -> bool:
         """Performs the full PKCE OAuth flow and optionally saves credentials to the main file."""
-        if not self.oauth_handler:
+        if not self.librespot_oauth_handler:
             self.logger.error("OAuth handler not initialized!")
             return False
         
@@ -757,7 +757,7 @@ class SpotifyAPI:
             raise SpotifyConfigError(error_msg)
         
         # Log which client identity is being used with a clear banner as requested
-        handler_client_id = self.oauth_handler.client_id if self.oauth_handler else None
+        handler_client_id = self.librespot_oauth_handler.client_id if self.librespot_oauth_handler else None
         is_official = (handler_client_id == DEVICE_CLIENT_ID or handler_client_id == CLIENT_ID)
         
         retry_suffix = " (Session Creation Failed)" if is_session_retry else ""
@@ -782,10 +782,10 @@ Searching and browsing metadata does NOT require authentication.
             self.logger.info(f"Proceeding with librespot PKCE OAuth flow ({'Desktop client_id' if handler_client_id == DEVICE_CLIENT_ID else 'Official client_id'}).")
         
         self.logger.info("Starting PKCE OAuth flow...")
-        auth_url = self.oauth_handler.get_authorization_url()
+        auth_url = self.librespot_oauth_handler.get_authorization_url()
         self._last_attempted_auth_url = auth_url # Store in main API object for interface.py
         
-        token_data = self.oauth_handler.perform_full_oauth_flow()
+        token_data = self.librespot_oauth_handler.perform_full_oauth_flow()
 
         if token_data:
             self.stored_token = StoredToken(token_data)
@@ -806,7 +806,7 @@ Searching and browsing metadata does NOT require authentication.
                 self.logger.info("Skipping save to main credentials file (save_to_main_file=False).")
             return True
         else:
-            self.logger.error(f"OAuth flow failed. Error: {self.oauth_handler.error_message if self.oauth_handler else 'Unknown OAuth error'}")
+            self.logger.error(f"OAuth flow failed. Error: {self.librespot_oauth_handler.error_message if self.librespot_oauth_handler else 'Unknown OAuth error'}")
             self.stored_token = None
             return False
 
