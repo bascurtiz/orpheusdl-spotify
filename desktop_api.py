@@ -3,6 +3,7 @@ import logging
 import re
 from pathlib import Path
 import time
+import uuid
 from urllib.parse import parse_qs
 import requests
 from Crypto.Cipher import AES
@@ -30,9 +31,11 @@ TIMEOUT = 30
 DEVICE_AUTH_URL = "https://accounts.spotify.com/oauth2/device/authorize"
 DEVICE_TOKEN_URL = "https://accounts.spotify.com/api/token"
 DEVICE_RESOLVE_URL = "https://accounts.spotify.com/pair/api/resolve"
+CLIENT_TOKEN_URL = "https://clienttoken.spotify.com/v1/clienttoken"
 DEVICE_CLIENT_ID = "65b708073fc0480ea92a077233ca87bd"
 DEVICE_SCOPE = "app-remote-control,playlist-modify,playlist-modify-private,playlist-modify-public,playlist-read,playlist-read-collaborative,playlist-read-private,streaming,transfer-auth-session,ugc-image-upload,user-follow-modify,user-follow-read,user-library-modify,user-library-read,user-modify,user-modify-playback-state,user-modify-private,user-personalized,user-read-birthdate,user-read-currently-playing,user-read-email,user-read-play-history,user-read-playback-position,user-read-playback-state,user-read-private,user-read-recently-played,user-top-read"
 DEVICE_FLOW_USER_AGENT = "Spotify/128600502 Win32_x86_64/0 (PC desktop)"
+# Legacy fallback token (dynamic token fetch is preferred and attempted first)
 DEVICE_CLIENT_TOKEN = "AADYATyeSD/y5/hrnY8iTzYaPodQdTzz/ffPg5WV8tD5KN53Yi/93r5TSMLRYo4aQCNgzl/1ckCkhFbOjPBWigpOdpvOZxfgJ3mov8/1IBpg05yWPKxwB7xV8SjNIlphPfj9LbrfbLZczrdYD0Wa++z+7sioGtI+m2GcgkOiRQgFqwEn8kP/PkIc/vHADZ1Zs3SZKif+5pXLlJ/0SDr8eZ+xECOXtfCw6jBAkl4r+wOMFrAMmE2JuLGFLg5PDD0="
 
 EXTENDED_METADATA_API_URL = "https://spclient.wg.spotify.com/extended-metadata/v0/extended-metadata"
@@ -163,6 +166,8 @@ class DesktopSpotifyApi:
         })
         self.client.cookies.set("sp_dc", sp_dc, domain=".spotify.com")
         self._access_token = None
+        self._client_token = None
+        self._device_id = uuid.uuid4().hex
         import threading
         self._emu_lock = threading.Lock()
         
@@ -170,9 +175,65 @@ class DesktopSpotifyApi:
         flow = SpotifyDeviceFlow(self.sp_dc)
         token_data = flow.get_token()
         self._access_token = token_data["access_token"]
+        self._client_token = self._fetch_client_token() or DEVICE_CLIENT_TOKEN
         self.client.headers.update({
             "authorization": f"Bearer {self._access_token}",
-            "client-token": DEVICE_CLIENT_TOKEN
+            "client-token": self._client_token
+        })
+
+    def _fetch_client_token(self) -> str | None:
+        payload = {
+            "client_data": {
+                "client_version": "1.2.82.471.gfc8488e1",
+                "client_id": DEVICE_CLIENT_ID,
+                "js_sdk_data": {
+                    "device_brand": "unknown",
+                    "device_model": "unknown",
+                    "os": "windows",
+                    "os_version": "10",
+                    "device_id": self._device_id,
+                    "device_type": "computer",
+                },
+            }
+        }
+        headers = {
+            "accept": "application/json",
+            "content-type": "application/json",
+            "origin": "https://open.spotify.com/",
+            "referer": "https://open.spotify.com/",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+            "app-platform": "WebPlayer",
+            "spotify-app-version": "1.2.82.471.gfc8488e1",
+        }
+        try:
+            response = self.client.post(
+                CLIENT_TOKEN_URL,
+                json=payload,
+                headers=headers,
+                timeout=TIMEOUT,
+            )
+            response.raise_for_status()
+            data = response.json()
+            token = (
+                data.get("granted_token", {}).get("token")
+                or data.get("token")
+            )
+            if token:
+                return token
+            logger.warning("Client token response did not contain a token.")
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to fetch dynamic client token, using fallback token: {e}")
+            return None
+
+    def _refresh_auth_headers(self):
+        flow = SpotifyDeviceFlow(self.sp_dc)
+        token_data = flow.get_token()
+        self._access_token = token_data["access_token"]
+        self._client_token = self._fetch_client_token() or DEVICE_CLIENT_TOKEN
+        self.client.headers.update({
+            "authorization": f"Bearer {self._access_token}",
+            "client-token": self._client_token,
         })
 
     def get_track_stream_info(self, track_id_base62: str, target_format_id: int):
@@ -286,6 +347,21 @@ class DesktopSpotifyApi:
             },
             timeout=TIMEOUT
         )
+        if response.status_code in (401, 403):
+            logger.warning(
+                "PlayPlay key request failed with %s, refreshing auth/client token and retrying once.",
+                response.status_code,
+            )
+            self._refresh_auth_headers()
+            response = self.client.post(
+                PLAYPLAY_LICENSE_API_URL.format(file_id=file_id_hex),
+                content=request.SerializeToString(),
+                headers={
+                    "Accept": "application/x-protobuf",
+                    "Content-Type": "application/x-protobuf",
+                },
+                timeout=TIMEOUT
+            )
         response.raise_for_status()
         
         license_resp = PlayPlayLicenseResponse()
