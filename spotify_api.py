@@ -1446,7 +1446,6 @@ Searching and browsing metadata does NOT require authentication.
             decryption_key = api.get_playplay_key(file_id_hex)
             
             import tempfile
-            import os
             project_root_for_temp = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
             target_temp_dir = os.path.join(project_root_for_temp, 'temp')
             os.makedirs(target_temp_dir, exist_ok=True)
