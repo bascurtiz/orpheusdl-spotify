@@ -1180,18 +1180,103 @@ Searching and browsing metadata does NOT require authentication.
 
     def is_desktop_api_available(self) -> bool:
         """Checks if all prerequisites for the Desktop API (Votify) are present."""
-        import os
+        cookie_path = self._resolve_spotify_cookies_path()
+        dll_path = self._resolve_spotify_dll_path()
+        cookie_exists = bool(cookie_path and os.path.exists(cookie_path))
+        dll_exists = bool(dll_path and os.path.exists(dll_path))
+        self.logger.info(
+            "[Spotify Desktop Prereq] cookies_path='%s' exists=%s | spotify_dll_path='%s' exists=%s",
+            cookie_path,
+            cookie_exists,
+            dll_path,
+            dll_exists,
+        )
+        return cookie_exists and dll_exists
+
+    def _resolve_spotify_cookies_path(self) -> str:
+        """Resolve spotify-cookies path across dev and frozen app modes."""
+        configured_path = (self.config.get("cookies_path") or "").strip()
+        return self._resolve_spotify_path(
+            configured_path=configured_path,
+            relative_default=os.path.join("config", "spotify-cookies.txt"),
+            app_support_default=os.path.expanduser("~/Library/Application Support/OrpheusDL GUI/config/spotify-cookies.txt"),
+        )
+
+    def _resolve_spotify_dll_path(self) -> str:
+        """Resolve Spotify.dll path across dev and frozen app modes."""
+        configured_path = (self.config.get("spotify_dll_path") or "").strip()
+        return self._resolve_spotify_path(
+            configured_path=configured_path,
+            relative_default="Spotify.dll",
+            app_support_default=os.path.expanduser("~/Library/Application Support/OrpheusDL GUI/Spotify.dll"),
+        )
+
+    def _resolve_spotify_path(self, configured_path: str, relative_default: str, app_support_default: str) -> str:
+        """
+        Resolve a user-configurable Spotify resource path with frozen-app fallbacks.
+        Priority:
+        1) Explicit absolute configured path
+        2) Relative configured/default in writable app data location (macOS App Support when frozen)
+        3) Bundled resources (PyInstaller/macOS .app Resources)
+        4) Project-root relative path (dev)
+        5) CWD-relative path
+        """
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-        
-        cookie_path = self.config.get("cookies_path")
-        if not cookie_path:
-            cookie_path = os.path.join(project_root, 'config', 'spotify-cookies.txt')
-            
-        dll_path = self.config.get("spotify_dll_path")
-        if not dll_path:
-            dll_path = os.path.join(project_root, 'Spotify.dll')
-            
-        return os.path.exists(cookie_path) and os.path.exists(dll_path)
+        relative_path = (configured_path or relative_default).replace("\\", "/")
+        if relative_path.startswith("./"):
+            relative_path = relative_path[2:]
+
+        if configured_path and os.path.isabs(configured_path):
+            return os.path.normpath(configured_path)
+
+        candidates = []
+        if getattr(sys, "frozen", False) and platform.system() == "Darwin":
+            # Bundled macOS app uses writable Application Support for user-managed files.
+            candidates.append(app_support_default)
+
+        if relative_path:
+            # Data dir based on executable location for frozen mode; cwd for dev mode.
+            if getattr(sys, "frozen", False):
+                if platform.system() == "Darwin":
+                    data_dir = os.path.expanduser("~/Library/Application Support/OrpheusDL GUI")
+                elif platform.system() == "Windows":
+                    data_dir = os.getenv("APPDATA") or os.path.expanduser("~")
+                    data_dir = os.path.join(data_dir, "OrpheusDL GUI")
+                else:
+                    data_dir = os.path.expanduser("~/.config/OrpheusDL-GUI")
+            else:
+                data_dir = os.getcwd()
+            candidates.append(os.path.join(data_dir, relative_path))
+
+            # PyInstaller temporary directory (_MEIPASS) if present.
+            meipass = getattr(sys, "_MEIPASS", None)
+            if meipass:
+                candidates.append(os.path.join(meipass, relative_path))
+
+            # macOS app bundle Resources directory.
+            if getattr(sys, "frozen", False) and platform.system() == "Darwin":
+                resources_base = os.path.normpath(os.path.join(os.path.dirname(sys.executable), "..", "Resources"))
+                candidates.append(os.path.join(resources_base, relative_path))
+
+            candidates.append(os.path.join(project_root, relative_path))
+            candidates.append(os.path.join(os.getcwd(), relative_path))
+
+        # Keep deterministic order while avoiding duplicate checks.
+        seen = set()
+        for candidate in candidates:
+            if not candidate:
+                continue
+            normalized = os.path.normpath(candidate)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            if os.path.exists(normalized):
+                return normalized
+
+        # Return best-effort normalized path for downstream error reporting.
+        if candidates:
+            return os.path.normpath(candidates[0])
+        return os.path.normpath(configured_path or relative_default)
 
     @staticmethod
     def _quality_tier_str(quality_tier) -> str:
@@ -1265,15 +1350,8 @@ Searching and browsing metadata does NOT require authentication.
             self.logger.error(f"Could not load desktop_api: {e}")
             raise SpotifyApiError(f"Desktop API not available ({e}). Did you install unplayplay?")
             
-        cookie_path = self.config.get("cookies_path")
-        dll_path = self.config.get("spotify_dll_path")
-        
-        import os
-        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-        if not cookie_path:
-            cookie_path = os.path.join(project_root, 'config', 'spotify-cookies.txt')
-        if not dll_path:
-            dll_path = os.path.join(project_root, 'Spotify.dll')
+        cookie_path = self._resolve_spotify_cookies_path()
+        dll_path = self._resolve_spotify_dll_path()
             
         sp_dc = None
         try:
