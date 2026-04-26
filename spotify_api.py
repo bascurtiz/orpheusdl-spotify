@@ -30,18 +30,28 @@ import secrets
 import base64
 import hashlib
 
-# Librespot imports
-from librespot.core import Session as LibrespotSession
-from librespot.proto import Authentication_pb2
-import librespot.core
-from librespot.metadata import TrackId, EpisodeId, PlaylistId
-from librespot.audio.decoders import AudioQuality as LibrespotAudioQualityEnum, VorbisOnlyAudioQuality
-from librespot.core import TokenProvider as LibrespotTokenProvider 
-from librespot.mercury import MercuryClient
-import weakref
-
-# Store reference to original LibrespotTokenProvider before any patching
-_OriginalLibrespotTokenProvider = librespot.core.TokenProvider
+# Optional librespot imports (legacy paths). Spotify downloads are desktop-only now.
+try:
+    from librespot.core import Session as LibrespotSession
+    from librespot.proto import Authentication_pb2
+    import librespot.core
+    from librespot.metadata import TrackId, EpisodeId, PlaylistId
+    from librespot.audio.decoders import AudioQuality as LibrespotAudioQualityEnum, VorbisOnlyAudioQuality
+    from librespot.core import TokenProvider as LibrespotTokenProvider
+    from librespot.mercury import MercuryClient
+    import weakref
+    _OriginalLibrespotTokenProvider = librespot.core.TokenProvider
+except Exception:  # pragma: no cover - desktop-only mode should not require librespot
+    LibrespotSession = object  # type: ignore
+    Authentication_pb2 = None  # type: ignore
+    librespot = None  # type: ignore
+    TrackId = EpisodeId = PlaylistId = None  # type: ignore
+    LibrespotAudioQualityEnum = None  # type: ignore
+    VorbisOnlyAudioQuality = None  # type: ignore
+    LibrespotTokenProvider = None  # type: ignore
+    MercuryClient = None  # type: ignore
+    weakref = None  # type: ignore
+    _OriginalLibrespotTokenProvider = None  # type: ignore
 
 # Attempt to import necessary types from utils.models for return types and enums
 try:
@@ -1065,36 +1075,12 @@ Searching and browsing metadata does NOT require authentication.
         finally:
             pass
 
-    def _is_session_valid(self, session_obj: Optional[LibrespotSession]) -> bool:
-        """Checks if the provided librespot session object is considered valid."""
-        self.logger.debug(f"_is_session_valid invoked. Type of session_obj: {type(session_obj)}")
-        if hasattr(self, 'librespot_session'): # Check if self.librespot_session is initialized
-            self.logger.debug(f"Is session_obj the same instance as self.librespot_session? {session_obj is self.librespot_session}")
-            if self.librespot_session is not None:
-                # Safely try to get username from self.librespot_session for comparison/debug
-                try:
-                    s_username = self.librespot_session.username()
-                    self.logger.debug(f"Username from self.librespot_session (internal): '{s_username}'")
-                except AttributeError:
-                    self.logger.debug("self.librespot_session does not have username() attribute internally at this point.")
-        else:
-            self.logger.debug("self.librespot_session attribute not yet initialized in SpotifyAPI instance.")
-
-        if session_obj is None:
-            self.logger.debug("_is_session_valid: session_obj argument is None.")
-            return False
+    def _is_session_valid(self, session_obj: Optional[object]) -> bool:
+        """Desktop-only auth check: session is valid when spotify-cookies + Spotify.dll are available."""
+        _ = session_obj
         try:
-            # Try a very basic check: if the session object exists and has a callable username method that returns a non-empty string.
-            username = session_obj.username()
-            is_logged_in_internal = session_obj.is_logged_in() if hasattr(session_obj, 'is_logged_in') else True
-            is_valid = username is not None and username != "" and is_logged_in_internal
-            self.logger.debug(f"_is_session_valid: username='{username}', is_logged_in_internal={is_logged_in_internal}, result={is_valid}")
-            return is_valid
-        except AttributeError as ae:
-            self.logger.warning(f"_is_session_valid: AttributeError encountered (session might be None or malformed): {ae}")
-            return False
-        except Exception as e:
-            self.logger.error(f"_is_session_valid: Unexpected error checking session validity: {e}", exc_info=True)
+            return self.is_desktop_api_available()
+        except Exception:
             return False
         
     # _fetch_user_market removed - no longer needed for Embed API
@@ -1503,7 +1489,42 @@ Searching and browsing metadata does NOT require authentication.
             
         return os.path.exists(cookie_path) and os.path.exists(dll_path)
 
+    @staticmethod
+    def _quality_tier_str(quality_tier) -> str:
+        if hasattr(quality_tier, "name"):
+            return quality_tier.name.upper()
+        if isinstance(quality_tier, str):
+            return quality_tier.upper()
+        return str(quality_tier).upper()
+
+    def is_spotify_lossless_desktop_tier(self, quality_tier, download_options) -> bool:
+        """True when the request matches the old 'FLAC / HiFi / lossless' desktop path (and librespot cannot do FLAC)."""
+        from utils.models import CodecEnum
+        qt_str = self._quality_tier_str(quality_tier)
+        if download_options and hasattr(download_options, "codec") and getattr(download_options, "codec", None) == CodecEnum.FLAC:
+            return True
+        return qt_str in ("LOSSLESS", "HIFI", "FLAC_24", "ATMOS")
+
+    def wants_spotify_ogg_desktop(self, quality_tier, download_options) -> bool:
+        """True when we should use the desktop PlayPlay path for OGG 320/160/96 (optional if DLL missing — librespot fallback)."""
+        from utils.models import CodecEnum
+        qt_str = self._quality_tier_str(quality_tier)
+        if self.is_spotify_lossless_desktop_tier(quality_tier, download_options):
+            return False
+        if download_options and hasattr(download_options, "codec") and getattr(download_options, "codec", None) == CodecEnum.VORBIS:
+            return True
+        if (not download_options) or (not hasattr(download_options, "codec")):
+            return qt_str in ("HIGH", "MEDIUM", "LOW", "MINIMUM")
+        if getattr(download_options, "codec", None) is None:
+            return qt_str in ("HIGH", "MEDIUM", "LOW", "MINIMUM")
+        return False
+
+    def wants_spotify_desktop_stream(self, quality_tier, download_options) -> bool:
+        """True if we should use the desktop stream path when sp_dc + Spotify.dll are available (FLAC/HiFi/Atmos/OGG Vorbis)."""
+        return self.is_spotify_lossless_desktop_tier(quality_tier, download_options) or self.wants_spotify_ogg_desktop(quality_tier, download_options)
+
     def get_track_download(self, **kwargs) -> Optional[TrackDownloadInfo]:
+        """Desktop-only Spotify audio download (requires sp_dc + Spotify.dll)."""
         track_id_base62 = kwargs.get("track_id_str") or kwargs.get("track_id")
         quality_tier = kwargs.get("quality_tier")
         download_options = kwargs.get("codec_options")
@@ -1513,222 +1534,18 @@ Searching and browsing metadata does NOT require authentication.
             self.logger.error("get_track_download: No track_id provided in kwargs")
             raise SpotifyApiError("No track_id provided for download")
 
-        # Convert base62 track ID to hex GID format required by librespot
-        track_id_hex = self._convert_base62_to_gid_hex(track_id_base62)
-        if not track_id_hex:
-            self.logger.error(f"Failed to convert track_id '{track_id_base62}' to hex GID format")
-            raise SpotifyApiError(f"Failed to convert track_id '{track_id_base62}' to hex GID format")
+        if not self.is_desktop_api_available():
+            raise SpotifyApiError(
+                "Desktop Spotify audio path requires spotify-cookies (sp_dc) and Spotify.dll. "
+                "Librespot fallback has been disabled."
+            )
 
-        try:
-            from utils.models import CodecEnum
-            import os
-            project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-            
-            cookie_path = self.config.get("cookies_path")
-            if not cookie_path:
-                cookie_path = os.path.join(project_root, 'config', 'spotify-cookies.txt')
-                
-            dll_path = self.config.get("spotify_dll_path")
-            if not dll_path:
-                dll_path = os.path.join(project_root, 'Spotify.dll')
-                
-            if hasattr(quality_tier, 'name'):
-                qt_str = quality_tier.name.upper()
-            elif isinstance(quality_tier, str):
-                qt_str = quality_tier.upper()
-
-            # Check for Desktop API (Votify) prerequisites
-            desktop_api_available = self.is_desktop_api_available()
-            skip_desktop_api = kwargs.get('skip_desktop_api', False)
-            
-            # Prefer Desktop API flow ONLY for FLAC (as it's optimized for Lossless extraction)
-            is_flac_requested = (download_options and hasattr(download_options, 'codec') and download_options.codec == CodecEnum.FLAC) or qt_str in ["LOSSLESS", "HIFI", "FLAC_24", "ATMOS"]
-            
-            if desktop_api_available and is_flac_requested and not skip_desktop_api:
-                self.logger.info("FLAC requested and Desktop API available, using Desktop API flow.")
-                return self._download_using_desktop_api(track_id_base62, track_info_obj, quality_tier, download_options)
-            elif is_flac_requested and not desktop_api_available:
-                self.logger.error("FLAC requested but Desktop API prerequisites (sp_dc or Spotify.dll) are missing.")
-                raise SpotifyApiError(f"Download aborted: Spotify.dll or cookies missing for {quality_tier} quality. Cannot download lossless.")
-        except ImportError:
-            pass
-
-        # Audio Download Logic with Session Recovery Retry
-        max_retries = 3
-        temp_file_path = None
-        track_id_obj = TrackId.from_hex(track_id_hex)
-        
-        for attempt in range(max_retries + 1):
-            try:
-                if not self._is_session_valid(self.librespot_session):
-                    if attempt > 0:
-                        self.logger.info(f"Librespot session recovery: Initializing fresh session (Attempt {attempt+1}/{max_retries+1})...")
-                    if not self._load_credentials_and_init_session() or not self._is_session_valid(self.librespot_session):
-                         raise SpotifyAuthError("Authentication required/failed for track download.")
-                
-                find_system_ffmpeg() # Just verify availability if needed
-        
-                self.logger.info(f"Fetching librespot Track metadata for GID hex: {track_id_hex}")
-                # Verbose logging to diagnose the quality tier input issue
-                qt_val = str(quality_tier)
-                qt_str = None
-                if hasattr(quality_tier, 'name'):
-                    qt_str = quality_tier.name.upper()
-                elif isinstance(quality_tier, str):
-                    qt_str = quality_tier.upper()
-                
-                # Robust mapping between Orpheus quality tiers and Librespot AudioQuality modes
-                # NORMAL = 96k (0), HIGH = 160k (1), VERY_HIGH = 320k (2)
-                if qt_str in ["LOSSLESS", "HIFI", "VERY_HIGH", "HIGH", "FLAC_24"]:
-                    librespot_audio_quality_mode = LibrespotAudioQualityEnum.VERY_HIGH
-                    display_bitrate = 320
-                elif qt_str in ["LOW", "NORMAL", "MEDIUM"]:
-                    librespot_audio_quality_mode = LibrespotAudioQualityEnum.HIGH
-                    display_bitrate = 160
-                else:
-                    librespot_audio_quality_mode = LibrespotAudioQualityEnum.NORMAL
-                    display_bitrate = 96
-
-                self.logger.info(f"Quality tier resolved: '{qt_str}', mapped to librespot: {librespot_audio_quality_mode.name if hasattr(librespot_audio_quality_mode, 'name') else librespot_audio_quality_mode} ({display_bitrate}kbps)")
-                # Ensure our audio key filter is still active before librespot operations
-                if hasattr(self, '_audio_key_filter'):
-                    # Reapply filter to ensure it's active for this operation
-                    for handler in logging.getLogger().handlers:
-                        if self._audio_key_filter not in handler.filters:
-                            handler.addFilter(self._audio_key_filter)
-            
-                content_feeder = self.librespot_session.content_feeder()
-                self.logger.info(f"Attempting to load track {track_id_hex} using content_feeder.load_track with VorbisOnlyAudioQuality.")
-                try:
-                    stream_loader = content_feeder.load_track(
-                        track_id_obj,
-                        VorbisOnlyAudioQuality(librespot_audio_quality_mode),
-                        False, 
-                        None   
-                    )
-                except Exception as load_err:
-                    # Check if this is a 404 error (likely an episode)
-                    error_str = str(load_err).lower()
-                    if "status code 404" in error_str or "extended metadata request failed" in error_str:
-                        self.logger.info(f"Track load failed with 404 for {track_id_hex}, likely an episode. Re-raising as SpotifyApiError for episode fallback.")
-                        raise SpotifyApiError(f"Failed to download track {track_id_hex}: Extended Metadata request failed: Status code 404") from load_err
-                    raise
-            
-                if not stream_loader or not hasattr(stream_loader, 'input_stream') or not stream_loader.input_stream:
-                    self.logger.error(f"Librespot returned no stream_loader or input_stream for track {track_id_hex} (TrackId: {str(track_id_obj)}).")
-                    try:
-                        track_metadata_check = track_id_obj.get(self.librespot_session)
-                        if track_metadata_check and not track_metadata_check.file:
-                             self.logger.error(f"Additionally, track metadata for GID {track_id_hex} has no associated audio files.")
-                             raise SpotifyTrackUnavailableError(f"No audio files listed for track GID {track_id_hex} and stream_loader failed.")
-                        elif not track_metadata_check:
-                             self.logger.error(f"Additionally, failed to get any track metadata from librespot for GID hex: {track_id_hex}")
-                    except ConnectionError as conn_err:
-                        # Check if this is a 404 error (likely an episode)
-                        error_str = str(conn_err).lower()
-                        if "status code 404" in error_str or "extended metadata request failed" in error_str:
-                            self.logger.info(f"Track metadata check failed with 404 for {track_id_hex}, likely an episode. Re-raising as SpotifyApiError for episode fallback.")
-                            raise SpotifyApiError(f"Failed to download track {track_id_hex}: Extended Metadata request failed: Status code 404") from conn_err
-                        raise
-                    except Exception as meta_err:
-                         self.logger.error(f"Error during additional metadata check for {track_id_hex} after stream_loader failure: {meta_err}")
-                    raise SpotifyTrackUnavailableError(f"Failed to load audio stream (no stream_loader or input_stream) for GID {track_id_hex}")
-                raw_audio_byte_stream = stream_loader.input_stream.stream()
-                temp_file_path = self._save_stream_to_temp_file(raw_audio_byte_stream, CodecEnum.VORBIS)
-                if not temp_file_path:
-                    self.logger.error(f"Failed to save downloaded stream for GID {track_id_hex} to a temp file.")
-                    if hasattr(stream_loader, 'input_stream') and stream_loader.input_stream and hasattr(stream_loader.input_stream, 'close'):
-                        try:
-                            stream_loader.input_stream.close()
-                        except Exception as close_ex:
-                            self.logger.warning(f"Exception while closing input_stream after save failure for track {track_id_hex}: {close_ex}")
-                    return None
-                self.logger.info(f"Successfully downloaded track {track_id_hex} to {temp_file_path}")
-                if track_info_obj:
-                    if hasattr(track_info_obj, 'codec'):
-                        track_info_obj.codec = CodecEnum.VORBIS
-                    if hasattr(track_info_obj, 'bitrate'):
-                        # Explicitly set the bitrate value based on our early mapping
-                        track_info_obj.bitrate = display_bitrate
-                    if hasattr(track_info_obj, 'sample_rate'):
-                        track_info_obj.sample_rate = 44.1
-                    if hasattr(track_info_obj, 'bit_depth'):
-                        track_info_obj.bit_depth = 16
-                
-                return TrackDownloadInfo(
-                    download_type=DownloadEnum.TEMP_FILE_PATH,
-                    temp_file_path=temp_file_path,
-                )
-
-            except RuntimeError as rt_err:
-                # Handle the specific "Failed fetching audio key!" error with a retry
-                if "Failed fetching audio key!" in str(rt_err) and attempt < max_retries:
-                    backoff_seconds = (attempt + 1) * 5
-                    self.logger.warning(f"Audio key fetching failed for {track_id_hex} (Attempt {attempt+1}/{max_retries+1}). "
-                                     f"Waiting {backoff_seconds}s, clearing Librespot session and attempting fresh recovery via OAuth refresh...")
-                    
-                    # Wait before retrying to let state settle
-                    time.sleep(backoff_seconds)
-                    
-                    # Force session close
-                    if self.librespot_session:
-                        try:
-                            self.librespot_session.close()
-                        except:
-                            pass
-                    self.librespot_session = None
-                    
-                    # Attempt fresh recovery by ensuring the token is refreshed
-                    # We don't delete credentials here yet, as _load_credentials_and_init_session will try to refresh them
-                    
-                    # Clean up any partial temp file from this failed attempt
-                    if temp_file_path and os.path.exists(temp_file_path):
-                        try: os.unlink(temp_file_path)
-                        except: pass
-                    temp_file_path = None
-                    continue
-                
-                # If we're here, it's either not an audio key error or we're out of retries
-                if "Failed fetching audio key!" in str(rt_err):
-                    is_premium = False
-                    if hasattr(self, 'librespot_session') and self.librespot_session:
-                        is_premium = (self.librespot_session.get_user_attribute("type", "free") == "premium")
-                    
-                    if not is_premium:
-                        error_msg = "Spotify Premium is required to download audio (Free accounts cannot fetch audio keys)."
-                        self.logger.warning(error_msg)
-                        raise SpotifyTrackUnavailableError(error_msg) from rt_err
-                    else:
-                        error_msg = "Spotify Premium audio key rejected. Your IP/Account may be temporarily rate-limited, or this track requires unsupported DRM."
-                        self.logger.warning(error_msg)
-                        raise SpotifyRateLimitDetectedError(error_msg) from rt_err
-                elif str(rt_err) == "Cannot get alternative track":
-                    self.logger.warning(f"Track {track_id_hex} is unavailable (librespot: Cannot get alternative track).")
-                    raise SpotifyTrackUnavailableError(f"Track {track_id_hex} is unavailable (Cannot get alternative track)") from rt_err
-                else:
-                    self.logger.error(f"Unhandled RuntimeError during get_track_download for {track_id_hex}: {rt_err}", exc_info=True)
-                    raise SpotifyApiError(f"Runtime error during track download {track_id_hex}: {rt_err}") from rt_err
-            
-            except SpotifyAuthError: 
-                raise # Re-raise auth errors to be handled by caller
-            except SpotifyTrackUnavailableError as e: 
-                self.logger.warning(f"Track {track_id_hex} is unavailable for download: {e}")
-                raise 
-            except SpotifyItemNotFoundError as e: 
-                self.logger.warning(f"Track metadata for {track_id_hex} not found: {e}")
-                raise 
-            except Exception as e:
-                error_str = str(e)
-                error_type = type(e).__name__
-                self.logger.error(f"Unexpected error during get_track_download for {track_id_hex}: {error_type}: {error_str}", exc_info=True)
-                
-                if temp_file_path and os.path.exists(temp_file_path):
-                    try:
-                        os.unlink(temp_file_path)
-                        self.logger.info(f"Cleaned up temp file {temp_file_path} after error in get_track_download.")
-                    except OSError as unlink_e:
-                        self.logger.error(f"Error unlinking temp file {temp_file_path} during error handling: {unlink_e}")
-                raise SpotifyApiError(f"Failed to download track {track_id_hex}: {e}") from e
+        return self._download_using_desktop_api(
+            track_id_base62,
+            track_info_obj,
+            quality_tier,
+            download_options,
+        )
 
     def close_session(self):
         """Placeholder for closing librespot session if needed by OrpheusDL's lifecycle."""
@@ -1787,7 +1604,7 @@ Searching and browsing metadata does NOT require authentication.
             
         if not os.path.isfile(dll_path):
             self.logger.error(f"Spotify.dll not found at: {dll_path}")
-            raise SpotifyApiError(f"Spotify.dll not found at {dll_path}. Lossless downloads require this file.")
+            raise SpotifyApiError(f"Spotify.dll not found at {dll_path}. Desktop stream downloads (FLAC/OGG) require this file.")
             
 
 
@@ -1801,7 +1618,12 @@ Searching and browsing metadata does NOT require authentication.
             
             from utils.models import CodecEnum
             qt_str = getattr(quality_tier, 'name', str(quality_tier)).upper()
-            is_flac = (download_options and hasattr(download_options, 'codec') and download_options.codec == CodecEnum.FLAC) or qt_str in ["LOSSLESS", "HIFI", "FLAC_24", "ATMOS"]
+            if download_options and hasattr(download_options, "codec") and getattr(download_options, "codec", None) == CodecEnum.FLAC:
+                is_flac = True
+            elif download_options and hasattr(download_options, "codec") and getattr(download_options, "codec", None) == CodecEnum.VORBIS:
+                is_flac = False
+            else:
+                is_flac = qt_str in ["LOSSLESS", "HIFI", "FLAC_24", "ATMOS"]
             
             target_format_id = 16 # Default FLAC
             stream_info = None
@@ -1824,14 +1646,16 @@ Searching and browsing metadata does NOT require authentication.
                     if stream_info:
                         self.logger.debug("Found standard FLAC stream!")
             else:
-                # OGG/VORBIS Mapping with smart fallback
+                # OGG/VORBIS mapping requested by project:
+                # HIGH -> 320k (id 4), LOW -> 160k (id 3), others -> 96k (id 2)
                 preferred_ids = []
-                if qt_str in ["VERY_HIGH", "HIGH", "HIFI"]:
-                    preferred_ids = [4, 3, 2] # 320k -> 160k -> 96k
-                elif qt_str in ["MEDIUM", "NORMAL"]:
-                    preferred_ids = [3, 4, 2] # 160k -> 320k -> 96k
+                if qt_str in ["VERY_HIGH", "HIGH"]:
+                    preferred_ids = [4, 3, 2]
+                elif qt_str in ["LOW"]:
+                    # 160k then 96k — never auto-upgrade to 320k (id 4) when OGG 160 / LOW is requested
+                    preferred_ids = [3, 2]
                 else:
-                    preferred_ids = [2, 3, 4] # 96k -> 160k -> 320k
+                    preferred_ids = [2, 3, 4]
                 
                 # Find the first available format ID from our preferred list
                 target_format_id = next((fid for fid in preferred_ids if fid in available_formats), None)
@@ -1863,9 +1687,32 @@ Searching and browsing metadata does NOT require authentication.
             with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension, dir=target_temp_dir) as temp_file:
                 temp_file_path = temp_file.name
                 
-            from .desktop_api import FLAC_IV, OGG_IV
-            target_iv = FLAC_IV if final_codec == CodecEnum.FLAC else OGG_IV
-            api.download_and_decrypt(stream_url, decryption_key, temp_file_path, iv_hex=target_iv)
+            from .desktop_api import FLAC_IV
+            if final_codec == CodecEnum.VORBIS:
+                # Match votify desktop PlayPlay behavior for OGG:
+                # decrypt with FLAC_IV and strip 167-byte preface before OggS.
+                target_iv = FLAC_IV
+                api.download_and_decrypt(
+                    stream_url,
+                    decryption_key,
+                    temp_file_path,
+                    iv_hex=target_iv,
+                    byte_skip=167,
+                )
+            else:
+                target_iv = FLAC_IV
+                api.download_and_decrypt(stream_url, decryption_key, temp_file_path, iv_hex=target_iv)
+            if final_codec == CodecEnum.VORBIS:
+                # Safety validation before tagger.
+                try:
+                    with open(temp_file_path, "rb") as f:
+                        magic = f.read(4)
+                except Exception:
+                    magic = b""
+                if magic != b"OggS":
+                    raise SpotifyApiError(
+                        f"Desktop OGG decrypt validation failed after votify-style decrypt (header={magic!r})."
+                    )
             
             if track_info_obj:
                 track_info_obj.codec = final_codec
@@ -1893,24 +1740,14 @@ Searching and browsing metadata does NOT require authentication.
             raise SpotifyApiError(f"Desktop download failure: {e}")
 
     def authenticate_stream_api(self, is_initial_setup_check: bool = False) -> bool:
-        """Alias for _load_credentials_and_init_session to maintain compatibility with interface.py."""
-        self.logger.debug(f"authenticate_stream_api called (aliased to _load_credentials_and_init_session). is_initial_setup_check={is_initial_setup_check}")
-        try:
-            result = self._load_credentials_and_init_session()
-            if not result:
-                # If authentication failed, check if OAuth flow was attempted
-                if self.oauth_handler and hasattr(self.oauth_handler, 'error_message') and self.oauth_handler.error_message:
-                    self.logger.error(f"Authentication failed: {self.oauth_handler.error_message}")
-                else:
-                    self.logger.error("Authentication failed: Unknown error during credential loading or OAuth flow")
-            return result
-        except SpotifyApiError as e:
-            self.logger.error(f"authenticate_stream_api failed: {e}")
-            if isinstance(e, (SpotifyAuthError, SpotifyConfigError, SpotifyLibrespotError)):
-                 return False 
-        except Exception as e:
-            self.logger.error(f"Unexpected error in authenticate_stream_api: {e}", exc_info=True)
-            return False 
+        """Desktop-only auth (sp_dc + Spotify.dll)."""
+        _ = is_initial_setup_check
+        ok = self.is_desktop_api_available()
+        if not ok:
+            self.logger.error(
+                "Spotify desktop auth prerequisites missing: spotify-cookies (sp_dc) and/or Spotify.dll."
+            )
+        return ok
 
     def get_last_error(self) -> Optional[str]:
         """Returns the last error message from the OAuth handler if it exists."""
@@ -2319,7 +2156,7 @@ Searching and browsing metadata does NOT require authentication.
             
             # Determine initial metadata for the UI logs based on requested quality
             initial_codec = CodecEnum.VORBIS
-            initial_bitrate = 160
+            initial_bitrate = 96
             initial_bit_depth = 16
             initial_sample_rate = 44.1
 
@@ -2329,12 +2166,15 @@ Searching and browsing metadata does NOT require authentication.
             elif isinstance(quality_tier, str):
                 qt_str = quality_tier.upper()
 
-            if qt_str in ["LOSSLESS", "HIFI", "FLAC_24"]:
+            if qt_str in ["LOSSLESS", "HIFI", "ATMOS", "FLAC_24"]:
                 initial_codec = CodecEnum.FLAC
                 initial_bitrate = None
-                if qt_str in ["HIFI", "FLAC_24"]: initial_bit_depth = 24
+                if qt_str in ["HIFI", "ATMOS", "FLAC_24"]:
+                    initial_bit_depth = 24
             elif qt_str in ["VERY_HIGH", "HIGH"]:
                 initial_bitrate = 320
+            elif qt_str in ["LOW"]:
+                initial_bitrate = 160
 
             track_info_instance = TrackInfo(
                 id=track_id,
@@ -2711,7 +2551,7 @@ Searching and browsing metadata does NOT require authentication.
             )
             
             # Determine initial metadata for the UI logs based on requested quality
-            initial_bitrate = 160
+            initial_bitrate = 96
             initial_bit_depth = 16
             initial_sample_rate = 44.1
 
@@ -2721,11 +2561,14 @@ Searching and browsing metadata does NOT require authentication.
             elif isinstance(quality_tier, str):
                 qt_str = quality_tier.upper()
 
-            if qt_str in ["LOSSLESS", "HIFI", "FLAC_24"]:
+            if qt_str in ["LOSSLESS", "HIFI", "ATMOS", "FLAC_24"]:
                 initial_bitrate = None
-                if qt_str == "FLAC_24": initial_bit_depth = 24
+                if qt_str in ["HIFI", "ATMOS", "FLAC_24"]:
+                    initial_bit_depth = 24
             elif qt_str in ["VERY_HIGH", "HIGH"]:
                 initial_bitrate = 320
+            elif qt_str in ["LOW"]:
+                initial_bitrate = 160
 
             track_info_instance = TrackInfo(
                 id=track_id,
@@ -3320,11 +3163,11 @@ Searching and browsing metadata does NOT require authentication.
             raise SpotifyApiError(f"Unexpected error fetching episode {episode_id}: {e}")
 
     def get_episode_download(self, **kwargs) -> Optional[TrackDownloadInfo]:
-        """Download episode audio using librespot. Same approach as get_track_download but for episodes."""
-        episode_id_base62 = kwargs.get("track_id_str") or kwargs.get("track_id") or kwargs.get("episode_id")
-        quality_tier = kwargs.get("quality_tier")
-        download_options = kwargs.get("codec_options")
-        track_info_obj = kwargs.get("track_info_obj")
+        """Episode audio download is disabled in desktop-only Spotify mode."""
+        _ = kwargs
+        raise SpotifyTrackUnavailableError(
+            "Spotify episode downloads are unavailable: librespot path was removed in desktop-only mode."
+        )
 
         if not episode_id_base62:
             self.logger.error("get_episode_download: No episode_id provided in kwargs")
@@ -3355,12 +3198,12 @@ Searching and browsing metadata does NOT require authentication.
             elif isinstance(quality_tier, str):
                 qt_str = quality_tier.upper()
 
-            # Robust mapping between Orpheus quality tiers and Librespot AudioQuality modes
-            # NORMAL = 96k (0), HIGH = 160k (1), VERY_HIGH = 320k (2)
-            if qt_str in ["LOSSLESS", "HIFI", "VERY_HIGH", "HIGH", "FLAC_24"]:
+            # Mapping requested by project:
+            # HIGH -> 320k, LOW -> 160k, other OGG tiers -> 96k
+            if qt_str in ["LOSSLESS", "HIFI", "ATMOS", "VERY_HIGH", "HIGH", "FLAC_24"]:
                 librespot_audio_quality_mode = LibrespotAudioQualityEnum.VERY_HIGH
                 display_bitrate = 320
-            elif qt_str in ["LOW", "NORMAL", "MEDIUM"]:
+            elif qt_str in ["LOW"]:
                 librespot_audio_quality_mode = LibrespotAudioQualityEnum.HIGH
                 display_bitrate = 160
             else:

@@ -423,7 +423,14 @@ class DesktopSpotifyApi:
 
 
 
-    def download_and_decrypt(self, stream_url: str, decryption_key: bytes, output_path: str, iv_hex: str = FLAC_IV):
+    def download_and_decrypt(
+        self,
+        stream_url: str,
+        decryption_key: bytes,
+        output_path: str,
+        iv_hex: str = FLAC_IV,
+        byte_skip: int = 0,
+    ):
         iv_bytes = bytes.fromhex(iv_hex)
         cipher = AES.new(
             key=decryption_key,
@@ -437,7 +444,11 @@ class DesktopSpotifyApi:
         import httpx
         with httpx.stream("GET", stream_url, timeout=TIMEOUT) as response:
             response.raise_for_status()
-            with open(output_path, "wb") as f:
-                for chunk in response.iter_bytes(chunk_size=16384):
-                    if chunk:
-                        f.write(cipher.decrypt(chunk))
+            encrypted_data = response.read()
+
+        decrypted_data = cipher.decrypt(encrypted_data)
+        if byte_skip > 0:
+            decrypted_data = decrypted_data[byte_skip:]
+
+        with open(output_path, "wb") as f:
+            f.write(decrypted_data)

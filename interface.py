@@ -102,10 +102,7 @@ module_information = ModuleInformation(
     ],
     login_behaviour=ManualEnum.manual,
     global_settings={
-        "username": "",
         "download_pause_seconds": 30,
-        "client_id": "",
-        "client_secret": "",
         "cookies_path": "",
         "spotify_dll_path": "./Spotify.dll"
     },
@@ -162,97 +159,29 @@ class ModuleInterface:
         }
 
     def _ensure_authenticated(self, context_message: str, silent: bool = False) -> bool:
-        """Checks if authenticated and attempts login if not. Returns True if authenticated, False otherwise."""
+        """Desktop-only auth check (sp_dc + Spotify.dll)."""
         if self.debug_mode:
-            self.logger.info(f"[{context_message}] Entry point for _ensure_authenticated.")
-        session_is_initially_valid = self.spotify_api._is_session_valid(self.spotify_api.librespot_session)
-        if self.debug_mode:
-            self.logger.info(f"[{context_message}] Initial _is_session_valid check returned: {session_is_initially_valid}")
-
-        if not session_is_initially_valid:
-            if self.debug_mode:
-                self.logger.info(f"[{context_message}] Session not initially valid. Attempting login via authenticate_stream_api (non-forced)...")
-            try:
-                auth_attempt_result = self.spotify_api.authenticate_stream_api() # Non-forced
-                if self.debug_mode:
-                    self.logger.info(f"[{context_message}] authenticate_stream_api (non-forced) call returned: {auth_attempt_result}")
-                
-                if not auth_attempt_result:
-                    self.logger.warning(f"[{context_message}] authenticate_stream_api (non-forced) indicated failure. Setting logged_in=False.")
-                    
-                    cfg = self.spotify_api.config or {}
-                    username = (cfg.get('username') or '').strip()
-                    last_error = self.spotify_api.get_last_error()
-                    last_exit_reason = self.spotify_api.get_last_exit_reason()
-                    auth_url = self.spotify_api.get_auth_url()
-
-                    if not silent:
-                        if not username:
-                            error_msg = "Spotify username is required for downloading. Please fill in your username in the settings."
-                            self.printer.oprint(error_msg)
-                        else:
-                            if auth_url:
-                                self.printer.oprint("\n- ACTION REQUIRED: PROVE YOU ARE A USER -")
-                                self.printer.oprint("A browser window should have opened automatically to Spotify.")
-                                self.printer.oprint("If it didn't open, please copy/paste the URL below manually:")
-                                self.printer.oprint(f"\nURL: {auth_url}")
-                                self.printer.oprint("\nAfter you see 'Successfully authenticated' in the browser, try this download again.")
-                            else:
-                                self.printer.oprint("Spotify Authentication failed and no authorization URL could be generated.")
-                                self.printer.oprint("Please check your Spotify username in Settings.")
-                    self.logged_in = False
-                    if self.debug_mode:
-                        self.logger.info(f"[{context_message}] _ensure_authenticated returning False (auth_attempt_result was False).")
-                    return False
-                
-                # Even if authenticate_stream_api returns True, re-verify with _is_session_valid
-                if self.debug_mode:
-                    self.logger.info(f"[{context_message}] authenticate_stream_api (non-forced) returned True. Re-validating session...")
-                final_session_check = self.spotify_api._is_session_valid(self.spotify_api.librespot_session)
-                if self.debug_mode:
-                    self.logger.info(f"[{context_message}] Post-auth attempt _is_session_valid check returned: {final_session_check}")
-                
-                if final_session_check:
-                    if self.debug_mode:
-                        self.logger.info(f"[{context_message}] Session is now valid. Setting logged_in=True.")
-                    self.logged_in = True
-                    if self.debug_mode:
-                        self.logger.info(f"[{context_message}] _ensure_authenticated returning True (session confirmed valid post-auth attempt).")
-                    return True
-                else:
-                    self.logger.warning(f"[{context_message}] Session STILL NOT VALID after authenticate_stream_api reported success. Setting logged_in=False.")
-                    if not silent:
-                        self.printer.oprint("Spotify authentication seemed to succeed but session remains invalid.")
-                    self.logged_in = False
-                    if self.debug_mode:
-                        self.logger.info(f"[{context_message}] _ensure_authenticated returning False (session invalid despite auth attempt success report).")
-                    return False
-            except SpotifyConfigError:
-                # Re-raise so caller (e.g. search) can propagate to GUI and show credentials message
-                raise
-            except SpotifyAuthError as e:
-                self.logger.error(f"[{context_message}] SpotifyAuthError caught during authenticate_stream_api (non-forced) call: {e}")
-                if not silent:
-                    self.printer.oprint(f"Spotify authentication failed: {e}")
-                self.logged_in = False
-                if self.debug_mode:
-                    self.logger.info(f"[{context_message}] _ensure_authenticated returning False (SpotifyAuthError caught).")
-                return False
-            except Exception as e_auth_unexpected: # Catch any other unexpected errors during the auth attempt
-                self.logger.error(f"[{context_message}] Unexpected exception during authenticate_stream_api (non-forced) call: {e_auth_unexpected}", exc_info=True)
-                if not silent:
-                    self.printer.oprint(f"An unexpected error occurred during Spotify authentication: {e_auth_unexpected}")
-                self.logged_in = False
-                if self.debug_mode:
-                    self.logger.info(f"[{context_message}] _ensure_authenticated returning False (unexpected exception caught).")
-                return False
-        else:
-            if self.debug_mode:
-                self.logger.info(f"[{context_message}] Session was already valid. Setting logged_in=True.")
-            self.logged_in = True
-            if self.debug_mode:
-                self.logger.info(f"[{context_message}] _ensure_authenticated returning True (session was initially valid).")
-            return True
+            self.logger.info(f"[{context_message}] Desktop-only auth check.")
+        try:
+            auth_ok = self.spotify_api.authenticate_stream_api()
+            self.logged_in = bool(auth_ok)
+            if not auth_ok and not silent:
+                self.printer.oprint(
+                    "Spotify desktop authentication requirements missing. "
+                    "Please set spotify-cookies.txt (sp_dc) and Spotify.dll in Settings."
+                )
+            return bool(auth_ok)
+        except SpotifyConfigError:
+            raise
+        except Exception as e_auth_unexpected:
+            self.logger.error(
+                f"[{context_message}] Unexpected exception during desktop auth check: {e_auth_unexpected}",
+                exc_info=True,
+            )
+            if not silent:
+                self.printer.oprint(f"An unexpected error occurred during Spotify authentication: {e_auth_unexpected}")
+            self.logged_in = False
+            return False
 
     def login(self) -> bool:
         if self.debug_mode:
@@ -677,7 +606,10 @@ class ModuleInterface:
         # Check authentication first if we want to fail early for downloads.
         # Use silent=True because we'll return the error in TrackInfo.error for the downloader to print.
         auth_ok = self._ensure_authenticated("get_track_info", silent=True)
-        error_msg = "Spotify credentials are required for downloading. Please fill in your username, client ID and secret in the settings."
+        error_msg = (
+            "Spotify download requirements missing: place Spotify.dll and a valid spotify-cookies.txt "
+            "(with sp_dc) in Settings. Active Premium subscription required."
+        )
 
         try:
             # First, attempt to get track info from spotify_api
@@ -910,23 +842,16 @@ class ModuleInterface:
         if codec_options is None:
             codec_options = kwargs.get("codec_options") or kwargs.get("codec_data")
             
-        # Determine if Desktop API flow will be used for FLAC
-        # This allows us to skip the browser OAuth flow (Librespot) if only downloading FLAC
-        qt_str = ""
-        if hasattr(quality_tier, 'name'):
-            qt_str = quality_tier.name.upper()
-        elif isinstance(quality_tier, str):
-            qt_str = quality_tier.upper()
-
-        is_flac_requested = (codec_options and hasattr(codec_options, 'codec') and codec_options.codec == CodecEnum.FLAC) or qt_str in ["LOSSLESS", "HIFI", "FLAC_24", "ATMOS"]
-        using_desktop_api = is_flac_requested and self.spotify_api.is_desktop_api_available()
+        # Desktop API (sp_dc + Spotify.dll): FLAC/lossless and OGG Vorbis — skip Librespot OAuth for those when configured
+        wants_desktop = self.spotify_api.wants_spotify_desktop_stream(quality_tier, codec_options)
+        using_desktop_api = wants_desktop and self.spotify_api.is_desktop_api_available()
 
         if using_desktop_api:
-            self.logger.info("Using Desktop API for FLAC download, skipping Librespot session check.")
+            self.logger.info("Using Desktop API for Spotify stream (FLAC/OGG), skipping Librespot session check.")
         else:
-            # Ensure authentication (Librespot/OAuth) before proceeding for OGG/Episodes
+            # Librespot OAuth for OGG (when desktop not used), episodes, etc.
             if not self._ensure_authenticated("get_track_download"):
-                self.logger.warning("Librespot authentication failed in get_track_download, cannot proceed for non-FLAC track.")
+                self.logger.warning("Librespot authentication failed in get_track_download, cannot proceed for this track.")
                 return None
             
         track_info = kwargs.get("track_info_obj")
