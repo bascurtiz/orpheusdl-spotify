@@ -88,7 +88,6 @@ from .spotify_api import (
     SpotifyAuthError,
     SpotifyConfigError,
     SpotifyNeedsUserRedirectError,
-    SpotifyLibrespotError,
     SpotifyRateLimitDetectedError,
     SpotifyItemNotFoundError,
     SpotifyTrackUnavailableError,

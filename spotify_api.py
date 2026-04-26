@@ -30,28 +30,11 @@ import secrets
 import base64
 import hashlib
 
-# Optional librespot imports (legacy paths). Spotify downloads are desktop-only now.
+# Optional TrackId import for base62->gid conversion helper.
 try:
-    from librespot.core import Session as LibrespotSession
-    from librespot.proto import Authentication_pb2
-    import librespot.core
-    from librespot.metadata import TrackId, EpisodeId, PlaylistId
-    from librespot.audio.decoders import AudioQuality as LibrespotAudioQualityEnum, VorbisOnlyAudioQuality
-    from librespot.core import TokenProvider as LibrespotTokenProvider
-    from librespot.mercury import MercuryClient
-    import weakref
-    _OriginalLibrespotTokenProvider = librespot.core.TokenProvider
-except Exception:  # pragma: no cover - desktop-only mode should not require librespot
-    LibrespotSession = object  # type: ignore
-    Authentication_pb2 = None  # type: ignore
-    librespot = None  # type: ignore
-    TrackId = EpisodeId = PlaylistId = None  # type: ignore
-    LibrespotAudioQualityEnum = None  # type: ignore
-    VorbisOnlyAudioQuality = None  # type: ignore
-    LibrespotTokenProvider = None  # type: ignore
-    MercuryClient = None  # type: ignore
-    weakref = None  # type: ignore
-    _OriginalLibrespotTokenProvider = None  # type: ignore
+    from librespot.metadata import TrackId
+except Exception:
+    TrackId = None  # type: ignore
 
 # Attempt to import necessary types from utils.models for return types and enums
 try:
@@ -123,9 +106,10 @@ DEVICE_FLOW_USER_AGENT = "Spotify/128600502 Win32_x86_64/0 (PC desktop)"
 
 
 def _get_spotify_credentials_dir() -> str:
-    """Return the directory for Spotify credentials (credentials.json, librespot cache).
-    On macOS when running as a bundled .app, use ~/Library/Application Support/OrpheusDL GUI/config/spotify
-    so config is writable (the .app bundle is read-only). Otherwise use project config/spotify relative to module."""
+    """Return the directory for Spotify credentials (credentials.json).
+    On macOS when running as a bundled .app, use ~/Library/Application Support/OrpheusDL GUI/config
+    so config is writable (the .app bundle is read-only). Otherwise use project config relative to module.
+    This avoids creating a dedicated config/spotify subfolder."""
     is_frozen = getattr(sys, "frozen", False)
     is_macos = platform.system() == "Darwin"
     if is_macos and is_frozen:
@@ -133,10 +117,10 @@ def _get_spotify_credentials_dir() -> str:
         meipass = getattr(sys, "_MEIPASS", "") or ""
         if ".app/Contents" in exe_path or ".app" in meipass:
             app_support = os.path.expanduser("~/Library/Application Support/OrpheusDL GUI")
-            cred_dir = os.path.join(app_support, "config", "spotify")
+            cred_dir = os.path.join(app_support, "config")
             return os.path.abspath(cred_dir)
-    # Default: next to project root (config/spotify)
-    return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "config", "spotify"))
+    # Default: next to project root (config)
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "config"))
 
 
 # --- PKCE Helper Functions ---
@@ -409,15 +393,11 @@ class SpotifyNeedsUserRedirectError(SpotifyAuthError):
         self.auth_url = auth_url
         super().__init__(f"Spotify requires authorization. Please visit: {auth_url}")
 
-class SpotifyLibrespotError(SpotifyAuthError):
-    """Exception for errors during librespot interaction."""
-    pass
-
-class SpotifyTrackUnavailableError(SpotifyLibrespotError):
+class SpotifyTrackUnavailableError(SpotifyAuthError):
     """Raised when a track is unavailable."""
     pass
 
-class SpotifyRateLimitDetectedError(SpotifyLibrespotError):
+class SpotifyRateLimitDetectedError(SpotifyAuthError):
     """Raised when rate limit is detected."""
     pass
 
@@ -440,7 +420,7 @@ class PkceTokenDetails: # Simplified for current use if only access_token is man
         return (self.issued_at + self.expires_in - margin_seconds) < time.time()
 
 class StoredToken: 
-    """Token storage class compatible with librespot TokenProvider."""
+    """OAuth token storage helper."""
     def __init__(self, token_data: dict):
         self.timestamp = int(time.time() * 1000)  # milliseconds
         self.expires_in = int(token_data.get("expires_in", 3600))
@@ -465,59 +445,6 @@ class StoredToken:
     def from_dict(cls, data: dict) -> 'StoredToken':
         return cls(data)
 
-class LibrespotAudioKeyFilter(logging.Filter):
-    """Filter to suppress noisy librespot audio key error messages and rate limit warnings"""
-    def filter(self, record):
-        try:
-            message = record.getMessage()
-            message_lower = message.lower()
-            logger_name_lower = record.name.lower()
-            
-            # Comprehensive suppression of audio key error messages
-            suppress_patterns = [
-                'audio key error',
-                'failed fetching audio key',
-                'audiokeymanager',
-                'spotify rate limit detected during track download',
-                'rate limit suspected: failed fetching audio key'
-            ]
-            
-            # Check if any suppress pattern matches the message
-            for pattern in suppress_patterns:
-                if pattern in message_lower:
-                    return False
-            
-            # Additional check for CRITICAL level messages with specific content
-            if record.levelno >= logging.CRITICAL:
-                critical_suppress_patterns = [
-                    'audio key error',
-                    'failed fetching audio key',
-                    'code: 2'
-                ]
-                for pattern in critical_suppress_patterns:
-                    if pattern in message_lower:
-                        return False
-            
-            # Check logger name patterns
-            logger_suppress_patterns = [
-                'librespot',
-                'audiokeymanager'
-            ]
-            
-            for pattern in logger_suppress_patterns:
-                if pattern in logger_name_lower:
-                    # If it's from a librespot logger, check for audio key content
-                    if ('audio key' in message_lower or 
-                        'failed fetching' in message_lower or
-                        'code: 2' in message_lower):
-                        return False
-            
-            return True
-            
-        except Exception:
-            # If there's any error in filtering, allow the message through
-            return True
-
 class SpotifyAPI:
     logger = logging.getLogger(__name__)
 
@@ -533,7 +460,6 @@ class SpotifyAPI:
     def __init__(self, config=None, module_controller=None):
         self.config = config if config else {}
         self.module_controller = module_controller
-        self.librespot_session: Optional[LibrespotSession] = None        
         self.user_market: Optional[str] = None
         
         # Initialize Spotify Embed Client for metadata operations (no OAuth required)
@@ -561,76 +487,29 @@ class SpotifyAPI:
         
         # Token storage
         self.stored_token: Optional[StoredToken] = None
-        self.librespot_stored_token: Optional[StoredToken] = None
-        
-        # Original librespot_oauth_handler (kept for fallback refresh)
-        self.librespot_oauth_handler = OAuth(DEVICE_CLIENT_ID, REDIRECT_URI, OAUTH_SCOPES, self.logger)
         
         self.last_custom_provider_id_created: Optional[int] = None 
-        self.last_custom_provider_id_created: Optional[int] = None # ADDED FOR DIAGNOSTICS
-
-                # Set up logging filter to suppress noisy librespot messages
-        audio_key_filter = LibrespotAudioKeyFilter()
-        
-        # Apply filter to root logger
-        root_logger = logging.getLogger()
-        root_logger.addFilter(audio_key_filter)
-        
-        # Apply to all existing handlers on root logger
-        for handler in root_logger.handlers:
-            handler.addFilter(audio_key_filter)
-        
-        # Apply to all possible logger names that might be used by librespot
-        potential_logger_names = [
-            'librespot', 'Librespot', 'LIBRESPOT',
-            'librespot.core', 'Librespot.Core', 
-            'librespot.audio', 'Librespot.Audio',
-            'AudioKeyManager', 'audiokeymanager',
-            'spotify', 'Spotify', 'modules.spotify',
-            '__main__', 'root',
-            '', # Empty string for root logger edge cases
-        ]
-        
-        for logger_name in potential_logger_names:
-            logger = logging.getLogger(logger_name)
-            logger.addFilter(audio_key_filter)
-            # Also apply to any existing handlers on these loggers
-            for handler in logger.handlers:
-                handler.addFilter(audio_key_filter)
-        
-        # Store reference to reapply filter later if needed
-        self._audio_key_filter = audio_key_filter
-        
-        self.logger.debug("Added LibrespotAudioKeyFilter to suppress noisy audio key error messages and rate limit warnings")
 
         # Determine credentials directory
         self.credentials_dir = _get_spotify_credentials_dir()
         os.makedirs(self.credentials_dir, exist_ok=True)
         
-        # Separate credential files for Hybrid Auth
+        # Credential file for current Spotify auth flow
         self.credentials_file_path = os.path.join(self.credentials_dir, CREDENTIALS_FILE_NAME)
-        self.librespot_credentials_file_path = os.path.join(self.credentials_dir, "librespot_credentials.json")
         
         self.logger.info(f"Web API Credentials: {self.credentials_file_path}")
-        self.logger.info(f"Librespot OGG Credentials: {self.librespot_credentials_file_path}")
 
     def _save_credentials(self, token_obj: StoredToken, username: Optional[str] = "PKCE_USER"):
-        """Saves OAuth token data and a username to credentials.json for librespot."""        
+        """Saves OAuth token data and a username to credentials.json."""
         if not token_obj or not token_obj.access_token:
             self.logger.error("Cannot save credentials, token object or access token is missing.")
             return
-
-        credentials_content_for_librespot = {
-            "username": username if username else "PKCE_USER",
-            "auth_data": token_obj.access_token,
-            "type": "AUTHENTICATION_USER_PASS"
-        }
 
         # Save the full token details (including refresh token) for *our* use (e.g. refreshing)        
         full_token_details_for_storage = token_obj.to_dict()
         full_token_details_for_storage['spotify_username'] = username # Store the username we got/used
         # Store the client_id used for this token so we can detect if it changed
-        full_token_details_for_storage['client_id'] = self.librespot_oauth_handler.client_id if self.librespot_oauth_handler else None
+        full_token_details_for_storage['client_id'] = self.oauth_handler.client_id if self.oauth_handler else None
 
         try:
             # First, save the full token details (this is the primary credentials file now)
@@ -655,7 +534,7 @@ class SpotifyAPI:
             
             # Check if client_id has changed - if so, we need to re-authenticate with new credentials
             stored_client_id = token_data_from_file.get('client_id')
-            current_client_id = self.librespot_oauth_handler.client_id if self.librespot_oauth_handler else None
+            current_client_id = self.oauth_handler.client_id if self.oauth_handler else None
             
             # If no client_id is stored, it's from the old Desktop client_id (before we added this feature)
             # If we now have a custom client_id, we need to re-authenticate
@@ -709,23 +588,23 @@ class SpotifyAPI:
                         self.logger.error(f"Error removing credentials file: {e_rm}")
                     return False
                 
-                refreshed_token_data = self.librespot_oauth_handler.refresh_access_token(loaded_token.refresh_token)
+                refreshed_token_data = self.oauth_handler.refresh_access_token(loaded_token.refresh_token)
                 if refreshed_token_data:
                     self.stored_token = StoredToken(refreshed_token_data)
                     # Save the refreshed token
                     try:
                         token_dict = self.stored_token.to_dict()
                         token_dict['spotify_username'] = token_data_from_file.get('spotify_username', 'PKCE_USER')
-                        token_dict['client_id'] = self.librespot_oauth_handler.client_id if self.librespot_oauth_handler else None
+                        token_dict['client_id'] = self.oauth_handler.client_id if self.oauth_handler else None
                         with open(self.credentials_file_path, 'w') as f:
                             json.dump(token_dict, f, indent=4)
                         self.logger.info("Successfully refreshed and saved token.")
                     except Exception as e_save:
                         self.logger.warning(f"Could not save refreshed token: {e_save}")
                     self.logger.info("Successfully refreshed and loaded token.")
-                    return True # Librespot session will be created next
+                    return True
                 else:
-                    error_msg = self.librespot_oauth_handler.error_message if self.librespot_oauth_handler else "Unknown error"
+                    error_msg = self.oauth_handler.error_message if self.oauth_handler else "Unknown error"
                     self.logger.warning(f"Failed to refresh token: {error_msg}. Full re-authentication required.")
                     # Delete the invalid credentials file to force re-authentication
                     try:
@@ -737,7 +616,7 @@ class SpotifyAPI:
             else:
                 self.stored_token = loaded_token
                 self.logger.info("Successfully loaded valid existing token.")
-                return True # Librespot session will be created next
+                return True
 
         except json.JSONDecodeError:
             self.logger.error(f"Error decoding JSON from {self.credentials_file_path}. File might be corrupted.")
@@ -748,7 +627,7 @@ class SpotifyAPI:
 
     def _perform_oauth_flow(self, save_to_main_file: bool = True, is_session_retry: bool = False) -> bool:
         """Performs the full PKCE OAuth flow and optionally saves credentials to the main file."""
-        if not self.librespot_oauth_handler:
+        if not self.oauth_handler:
             self.logger.error("OAuth handler not initialized!")
             return False
         
@@ -767,7 +646,7 @@ class SpotifyAPI:
             raise SpotifyConfigError(error_msg)
         
         # Log which client identity is being used with a clear banner as requested
-        handler_client_id = self.librespot_oauth_handler.client_id if self.librespot_oauth_handler else None
+        handler_client_id = self.oauth_handler.client_id if self.oauth_handler else None
         is_official = (handler_client_id == DEVICE_CLIENT_ID or handler_client_id == CLIENT_ID)
         
         retry_suffix = " (Session Creation Failed)" if is_session_retry else ""
@@ -789,13 +668,13 @@ Searching and browsing metadata does NOT require authentication.
         if not is_official and handler_client_id:
             self.logger.info(f"Initiating OAuth flow using custom Client ID: {handler_client_id[:10]}...")
         else:
-            self.logger.info(f"Proceeding with librespot PKCE OAuth flow ({'Desktop client_id' if handler_client_id == DEVICE_CLIENT_ID else 'Official client_id'}).")
+            self.logger.info(f"Proceeding with PKCE OAuth flow ({'Desktop client_id' if handler_client_id == DEVICE_CLIENT_ID else 'Official client_id'}).")
         
         self.logger.info("Starting PKCE OAuth flow...")
-        auth_url = self.librespot_oauth_handler.get_authorization_url()
+        auth_url = self.oauth_handler.get_authorization_url()
         self._last_attempted_auth_url = auth_url # Store in main API object for interface.py
         
-        token_data = self.librespot_oauth_handler.perform_full_oauth_flow()
+        token_data = self.oauth_handler.perform_full_oauth_flow()
 
         if token_data:
             self.stored_token = StoredToken(token_data)
@@ -816,7 +695,7 @@ Searching and browsing metadata does NOT require authentication.
                 self.logger.info("Skipping save to main credentials file (save_to_main_file=False).")
             return True
         else:
-            self.logger.error(f"OAuth flow failed. Error: {self.librespot_oauth_handler.error_message if self.librespot_oauth_handler else 'Unknown OAuth error'}")
+            self.logger.error(f"OAuth flow failed. Error: {self.oauth_handler.error_message if self.oauth_handler else 'Unknown OAuth error'}")
             self.stored_token = None
             return False
 
@@ -836,88 +715,6 @@ Searching and browsing metadata does NOT require authentication.
             self.logger.error(f"Error fetching user details: {e}")
             return None
 
-    def _create_librespot_session_from_oauth(self) -> bool:
-        """Create librespot session using OAuth token with global TokenProvider patch."""
-        if not self.stored_token or not self.stored_token.access_token:
-            self.logger.error("No valid OAuth token available for librespot session creation.")
-            return False
-
-        spotify_username_for_librespot = "PKCE_LibrespotUser"
-        if os.path.exists(self.credentials_file_path):
-            try:
-                with open(self.credentials_file_path, 'r') as f_user:
-                    cred_data_user = json.load(f_user)
-                    spotify_username_for_librespot = cred_data_user.get('spotify_username', spotify_username_for_librespot)
-            except Exception as e_load_user:
-                self.logger.warning(f"Could not load username from credentials file, using default. Error: {e_load_user}")
-
-        self.logger.info(f"Attempting to create librespot session for user: '{spotify_username_for_librespot}' using OAuth token.")
-
-        try:
-            conf_builder = LibrespotSession.Configuration.Builder()
-            conf_builder.set_store_credentials(False) 
-            cache_path = os.path.join(self.credentials_dir, ".librespot_cache")
-            os.makedirs(cache_path, exist_ok=True)
-            conf_builder.set_cache_dir(cache_path)
-            conf_builder.set_cache_enabled(True)
-            conf = conf_builder.build()
-
-            builder = LibrespotSession.Builder(conf)
-            
-            auth_type_for_oauth = Authentication_pb2.AuthenticationType.values()[3] 
-            self.logger.info(f"Using AuthenticationType index 3 for OAuth: {Authentication_pb2.AuthenticationType.Name(auth_type_for_oauth)}")
-            
-            credentials_pb = Authentication_pb2.LoginCredentials(
-                username=spotify_username_for_librespot,
-                typ=auth_type_for_oauth,
-                auth_data=self.stored_token.access_token.encode('utf-8')
-            )
-            builder.login_credentials = credentials_pb
-            self.logger.info(f"Set LoginCredentials for Librespot with OAuth token for user {spotify_username_for_librespot}.")
-
-            self.logger.info("GLOBAL_PATCH_DEBUG: About to call builder.create()...")
-            self.librespot_session = builder.create() 
-            self.logger.info(f"GLOBAL_PATCH_DEBUG: builder.create() completed. Resulting session object ID: {id(self.librespot_session) if self.librespot_session else 'None'}")
-
-            if self.librespot_session:
-                self.logger.info(f"Librespot session created successfully. Username: {self.librespot_session.username()}. Device ID: {self.librespot_session.device_id()}")
-
-                # Test with a simple API call that requires a token, made via Librespot's mechanisms
-                try:                    
-                    example_track_id = TrackId.from_uri("spotify:track:0VjIjW4GlUZAMYd2vXMi3b") # The Weeknd - Blinding Lights
-                    self.logger.info(f"Performing post-session creation Librespot API test call (get_metadata_4_track for {str(example_track_id)})...")
-                    track_meta = self.librespot_session.api().get_metadata_4_track(example_track_id)
-                    self.logger.info(f"Post-session creation Librespot API test call SUCCEEDED. Track: {track_meta.name if track_meta else 'Unknown'}")
-                except Exception as e_meta_test:
-                    self.logger.error(f"Post-session creation Librespot API test call (get_metadata_4_track for {str(example_track_id) if 'example_track_id' in locals() else 'unknown track'}) FAILED: {e_meta_test}", exc_info=True)
-                    
-                return True
-            else:
-                self.logger.error("Librespot builder.create() returned None.")
-                return False # Session creation failed
-
-        except librespot.core.Session.SpotifyAuthenticationException as auth_exc:
-            is_custom = bool(self.config.get('client_id'))
-            error_msg = f"Librespot authentication failed during session creation: {auth_exc}"
-            if is_custom:
-                error_msg += " (Note: Custom Client IDs often do not support OGG streaming via Librespot/Mercury. Consider using official credentials for OGG downloads.)"
-            self.logger.error(error_msg)
-            self.librespot_session = None
-            return False
-
-        except MercuryClient.MercuryException as me:
-            self.logger.error(f"MercuryException during builder.create(): {me}", exc_info=True)
-            self.librespot_session = None # Clear session on error
-            return False
-        except Exception as e:
-            self.logger.error(f"Unexpected generic exception during Librespot session creation: {e}", exc_info=True)
-            self.librespot_session = None # Clear session on error
-            return False
-        
-        return False
-
-    # _get_web_api_token method removed - we now use embed_client for metadata operations
-
     def _clear_credentials(self):
         """Clear Spotify credentials file to force re-authentication."""
         if os.path.exists(self.credentials_file_path):
@@ -926,20 +723,6 @@ Searching and browsing metadata does NOT require authentication.
                 self.logger.info(f"Removed credentials file: {self.credentials_file_path}")
             except OSError as e:
                 self.logger.warning(f"Could not remove credentials file {self.credentials_file_path}: {e}")
-        
-        # Also clear librespot cache
-        self._clear_librespot_cache()
-
-    def _clear_librespot_cache(self):
-        """Clear librespot cache directory."""
-        cache_path = os.path.join(self.credentials_dir, ".librespot_cache")
-        if os.path.exists(cache_path):
-            try:
-                import shutil
-                shutil.rmtree(cache_path)
-                self.logger.info(f"Cleared Librespot cache at: {cache_path}")
-            except Exception as e:
-                self.logger.warning(f"Could not clear Librespot cache: {e}")
 
     def _init_web_api_client(self) -> bool:
         """
@@ -1004,85 +787,6 @@ Searching and browsing metadata does NOT require authentication.
             
         return False
 
-    def _load_credentials_and_init_session(self) -> bool:
-        """Loads existing OAuth credentials or performs PKCE flow, then creates librespot session.
-        Only required for downloading audio, not for metadata operations."""
-        self.logger.info("Attempting to authenticate and initialize librespot session for downloads...")
-        
-        # Check if required credentials are provided before attempting any OAuth flow
-        username = (self.config.get('username', '') or '').strip() if self.config else ''
-        if not username:
-            error_msg = (
-                "Spotify username is required for downloading. "
-                "Please fill in your username in the OrpheusDL GUI Settings tab (Spotify) or edit config/settings.json directly.\n\n"
-                "Note: Custom Client ID and Secret are optional and only needed for specific metadata features."
-            )
-            self.logger.error(error_msg)
-            raise SpotifyConfigError(error_msg)
-        
-        try:
-            librespot_loaded = False
-            credentials_existed = os.path.exists(self.credentials_file_path)
-            
-            # 1. Try to load existing credentials (refreshes automatically if expired)
-            if self._load_existing_credentials():
-                self.logger.info("Successfully loaded valid existing librespot OAuth credentials.")
-                self.librespot_stored_token = self.stored_token
-                librespot_loaded = True
-            else:
-                if credentials_existed:
-                    self.logger.warning("Existing librespot credentials file could not be loaded or refreshed. Clearing it.")
-                    self._clear_credentials()
-
-            # 2. If no valid credentials, perform full OAuth flow (PKCE with official client ID)
-            # This matches the "properly working" version's behavior of opening the browser for setup.
-            if not librespot_loaded:
-                self.logger.info("No valid existing librespot credentials found. Initiating full PKCE OAuth flow with official identity...")
-                if self._perform_oauth_flow(save_to_main_file=True):
-                    self.librespot_stored_token = self.stored_token
-                    self.logger.info("OAuth flow successful. Librespot credentials obtained.")
-                    librespot_loaded = True
-                else:
-                    self.logger.error("OAuth flow failed. Cannot initialize Librespot session.")
-                    return False
-            
-            # 3. Create librespot session using the token
-            self.stored_token = self.librespot_stored_token
-            if self._create_librespot_session_from_oauth():
-                self.logger.info("Successfully created/restored Librespot session.")
-                return True
-            else:
-                self.logger.error("Failed to create Librespot session with existing/refreshed credentials. Clearing and forcing re-auth.")
-                self._clear_credentials()
-                
-                # Force a retry with full OAuth flow
-                if self._perform_oauth_flow(save_to_main_file=True, is_session_retry=True):
-                    self.librespot_stored_token = self.stored_token
-                    self.stored_token = self.librespot_stored_token # Ensure mapped correctly
-                    if self._create_librespot_session_from_oauth():
-                        self.logger.info("Successfully created Librespot session after recovery re-auth.")
-                        return True
-                    else:
-                        self.logger.error("Second session creation attempt failed after re-auth.")
-                        return False
-                else:
-                    self.logger.error("Re-authentication attempt failed during session recovery.")
-                    return False
-
-        except Exception as e:
-            self.logger.error(f"Unexpected error during Librespot session initialization: {e}", exc_info=True)
-            return False
-        finally:
-            pass
-
-    def _is_session_valid(self, session_obj: Optional[object]) -> bool:
-        """Desktop-only auth check: session is valid when spotify-cookies + Spotify.dll are available."""
-        _ = session_obj
-        try:
-            return self.is_desktop_api_available()
-        except Exception:
-            return False
-        
     # _fetch_user_market removed - no longer needed for Embed API
 
     def _gid_to_base62(self, gid: bytes) -> str:
@@ -1498,7 +1202,7 @@ Searching and browsing metadata does NOT require authentication.
         return str(quality_tier).upper()
 
     def is_spotify_lossless_desktop_tier(self, quality_tier, download_options) -> bool:
-        """True when the request matches the old 'FLAC / HiFi / lossless' desktop path (and librespot cannot do FLAC)."""
+        """True when the request matches the desktop FLAC/lossless path."""
         from utils.models import CodecEnum
         qt_str = self._quality_tier_str(quality_tier)
         if download_options and hasattr(download_options, "codec") and getattr(download_options, "codec", None) == CodecEnum.FLAC:
@@ -1506,7 +1210,7 @@ Searching and browsing metadata does NOT require authentication.
         return qt_str in ("LOSSLESS", "HIFI", "FLAC_24", "ATMOS")
 
     def wants_spotify_ogg_desktop(self, quality_tier, download_options) -> bool:
-        """True when we should use the desktop PlayPlay path for OGG 320/160/96 (optional if DLL missing — librespot fallback)."""
+        """True when we should use the desktop PlayPlay path for OGG 320/160/96."""
         from utils.models import CodecEnum
         qt_str = self._quality_tier_str(quality_tier)
         if self.is_spotify_lossless_desktop_tier(quality_tier, download_options):
@@ -1548,26 +1252,11 @@ Searching and browsing metadata does NOT require authentication.
         )
 
     def close_session(self):
-        """Placeholder for closing librespot session if needed by OrpheusDL's lifecycle."""
-        if self.librespot_session:
-            try:
-                self.logger.info("Simulating librespot session closure (clearing reference).")
-                if hasattr(self.librespot_session, 'close') and callable(self.librespot_session.close):
-                    self.librespot_session.close()
-                    self.logger.info("Called self.librespot_session.close()")
-            except Exception as e:
-                self.logger.error(f"Error during librespot session close() method: {e}", exc_info=True)
-            finally:
-                self.librespot_session = None
-                self.stored_token = None 
-                self.oauth_handler = None 
-                self.user_market = None 
-                self.logger.info("Cleared librespot_session, stored_token, oauth_handler, and user_market.")
-        else: 
-            self.logger.info("No active librespot session to close. Ensuring other related attributes are cleared.")
-            self.stored_token = None
-            self.oauth_handler = None
-            self.user_market = None
+        """Clear in-memory Spotify auth/session state."""
+        self.stored_token = None
+        self.oauth_handler = None
+        self.user_market = None
+        self.logger.info("Cleared Spotify in-memory auth/session state.")
 
     def _download_using_desktop_api(self, track_id_base62: str, track_info_obj, quality_tier, download_options) -> Optional['TrackDownloadInfo']:
         try:
@@ -1937,8 +1626,8 @@ Searching and browsing metadata does NOT require authentication.
             track_union = track_data_graphql.get("trackUnion")
             
             if not track_union:
-                self.logger.warning(f"No track data returned from Embed API for ID: {track_id}. Attempting Librespot fallback.")
-                return self.get_track_via_librespot(track_id)
+                self.logger.warning(f"No track data returned from Embed API for ID: {track_id}.")
+                raise SpotifyItemNotFoundError(f"Track with ID {track_id} not found.")
                 
             name = track_union.get('name')
             duration_ms = track_union.get('duration', {}).get('totalMilliseconds')
@@ -2198,8 +1887,8 @@ Searching and browsing metadata does NOT require authentication.
             return track_info_instance
             
         except Exception as e:
-            self.logger.error(f"Unexpected error in get_track_info for track_id {track_id}: {e}. Attempting Librespot fallback.")
-            return self.get_track_via_librespot(track_id)
+            self.logger.error(f"Unexpected error in get_track_info for track_id {track_id}: {e}", exc_info=True)
+            raise SpotifyApiError(f"An unexpected error occurred while fetching track {track_id}: {e}")
 
     def get_album_info(self, album_id: str, metadata: Optional['AlbumInfo'] = None, _retry_attempted: bool = False, _retry_count: int = 0) -> Optional[dict]:
         self.logger.info(f"SpotifyAPI: Attempting to get album info for ID: {album_id}")
@@ -2434,239 +2123,6 @@ Searching and browsing metadata does NOT require authentication.
             self.logger.warning(f"Error fetching credits for {track_id} via GraphQL: {e}")
             return None
 
-    def get_track_via_librespot(self, track_id: str, quality_tier: QualityEnum = None) -> Optional[TrackInfo]:
-        """
-        Fallback method to get track info using Librespot (Mercury) when Web API fails.
-        """
-        self.logger.info(f"SpotifyAPI: Attempting to get track {track_id} via Librespot fallback...")
-        
-        if not self.librespot_session:
-            self.logger.warning("SpotifyAPI.get_track_via_librespot: No librespot session available.")
-            if not self._load_credentials_and_init_session():
-                 self.logger.error("SpotifyAPI.get_track_via_librespot: Failed to init session.")
-                 return None
-
-        try:
-            # Use Librespot's API to get track
-            # track_uri = f"spotify:track:{track_id}"
-            # t_id = TrackId.from_uri(track_uri) # This might not be directly exposed or needed if we use mercury
-            # But we can use the mercury client directly with the correct URL
-            
-            # Construct Mercury URL for track metadata
-            # usually: hm://metadata/4/track/<hex_id>
-            # But librespot has helpers. Let's try to use the session/mercury.
-            
-            # Convert base62 ID to hex
-            gid_hex = self._convert_base62_to_gid_hex(track_id)
-            if not gid_hex:
-                self.logger.error(f"SpotifyAPI.get_track_via_librespot: Could not convert {track_id} to GID.")
-                return None
-                
-            # We can use the 'spclient' or similar if available, or build the mercury request.
-            # Looking at how `get_playlist_via_librespot` works, it uses `self.librespot_session.api().get_playlist(p_id)`.
-            # Let's see if we can use `self.librespot_session.api().get_metadata_4_track(t_id)` or similar?
-            # Or `get_track(t_id)`?
-            
-            # The python-librespot usage:
-            # session.api().get_metadata_4_track(track_id)
-            
-            # We need to construct a TrackId object.
-            # From imports: from librespot.metadata import TrackId
-            
-            params = { 'id': track_id }
-            t_id = TrackId.from_base62(track_id)
-            
-            if not self.librespot_session.api():
-                 self.logger.error("SpotifyAPI.get_track_via_librespot: Session API not ready.")
-                 return None
-
-            try:
-                # Try getting track metadata
-                track_obj = self.librespot_session.api().get_metadata_4_track(t_id)
-            except Exception as e:
-                self.logger.warning(f"SpotifyAPI.get_track_via_librespot: Failed to get track via api().get_track(): {e}")
-                return None
-            
-            if not track_obj:
-                self.logger.warning("SpotifyAPI.get_track_via_librespot: Librespot returned None.")
-                return None
-
-            self.logger.info(f"SpotifyAPI.get_track_via_librespot: Successfully retrieved track via Librespot.")
-            
-            # Convert Librespot Track object to TrackInfo
-            name = track_obj.name
-            duration_ms = track_obj.duration
-            explicit = track_obj.explicit
-            
-            # Artists
-            artist_names = [a.name for a in track_obj.artist]
-            artist_ids = [self._gid_to_base62(a.gid) for a in track_obj.artist]
-            
-            # Album
-            album_name = track_obj.album.name
-            album_id = self._gid_to_base62(track_obj.album.gid)
-            total_tracks = getattr(track_obj.album, 'track_count', None)
-            
-            # Date/Year
-            release_year = 0
-            if track_obj.album.date and track_obj.album.date.year:
-                release_year = track_obj.album.date.year
-            
-            # Release Date string
-            release_date_str = f"{release_year}-01-01" # Default/approx if full date missing
-            if track_obj.album.date:
-                 # Construct date string if month/day available
-                 y = track_obj.album.date.year
-                 m = track_obj.album.date.month if track_obj.album.date.month else 1
-                 d = track_obj.album.date.day if track_obj.album.date.day else 1
-                 release_date_str = f"{y:04d}-{m:02d}-{d:02d}"
-
-            # Cover
-            cover_url = None
-            # Librespot covers are hex strings in `cover_group`
-            if track_obj.album.cover_group and track_obj.album.cover_group.image:
-                # Find largest? or first
-                for img in track_obj.album.cover_group.image:
-                    # img.file_id is bytes, convert to hex
-                    file_id_hex = img.file_id.hex()
-                    cover_url = f"https://i.scdn.co/image/{file_id_hex}"
-                    break # Use first found
-            
-            # Extract ISRC if available
-            isrc = None
-            if hasattr(track_obj, 'external_id') and track_obj.external_id:
-                for ex_id in track_obj.external_id:
-                    if hasattr(ex_id, 'type') and str(ex_id.type).lower() == 'isrc':
-                        isrc = ex_id.id
-                        break
-
-            # Tags
-            tags_obj = Tags(
-                album_artist=artist_names,
-                track_number=track_obj.number,
-                total_tracks=total_tracks,
-                disc_number=track_obj.disc_number,
-                release_date=release_date_str,
-                isrc=isrc,
-            )
-            
-            # Determine initial metadata for the UI logs based on requested quality
-            initial_bitrate = 96
-            initial_bit_depth = 16
-            initial_sample_rate = 44.1
-
-            qt_str = ""
-            if hasattr(quality_tier, 'name'):
-                qt_str = quality_tier.name.upper()
-            elif isinstance(quality_tier, str):
-                qt_str = quality_tier.upper()
-
-            if qt_str in ["LOSSLESS", "HIFI", "ATMOS", "FLAC_24"]:
-                initial_bitrate = None
-                if qt_str in ["HIFI", "ATMOS", "FLAC_24"]:
-                    initial_bit_depth = 24
-            elif qt_str in ["VERY_HIGH", "HIGH"]:
-                initial_bitrate = 320
-            elif qt_str in ["LOW"]:
-                initial_bitrate = 160
-
-            track_info_instance = TrackInfo(
-                id=track_id,
-                name=name,
-                artists=artist_names,
-                artist_id=artist_ids[0] if artist_ids else None,
-                album_id=album_id,
-                album=album_name,
-                duration=duration_ms // 1000 if duration_ms else 0,
-                cover_url=cover_url,
-                explicit=explicit,
-                tags=tags_obj,
-                codec=CodecEnum.VORBIS, 
-                release_year=release_year,
-                gid_hex=gid_hex,
-                bitrate=initial_bitrate,
-                bit_depth=initial_bit_depth,
-                sample_rate=initial_sample_rate,
-            )
-            
-            self.logger.debug(f"Successfully created TrackInfo details via Librespot for {track_id}. Returning object.")
-            return track_info_instance
-
-        except Exception as e:
-            self.logger.error(f"SpotifyAPI.get_track_via_librespot: Error: {e}", exc_info=True)
-            return None
-
-    def get_playlist_via_librespot(self, playlist_id: str) -> Optional[dict]:
-        """
-        Fallback method to get playlist info using Librespot (Mercury) when Web API fails (e.g. 403).
-        """
-        self.logger.info(f"SpotifyAPI: Attempting to get playlist {playlist_id} via Librespot fallback...")
-        
-        if not self.librespot_session:
-            self.logger.warning("SpotifyAPI.get_playlist_via_librespot: No librespot session available.")
-            if not self._load_credentials_and_init_session():
-                 self.logger.error("SpotifyAPI.get_playlist_via_librespot: Failed to init session.")
-                 return None
-
-        try:
-            # Use Librespot's API to get playlist
-            playlist_uri = f"spotify:playlist:{playlist_id}"
-            import librespot.metadata
-            p_id = PlaylistId.from_uri(playlist_uri)
-            
-            # Allow some time for session to be fully ready if just created
-            if not self.librespot_session.api():
-                 self.logger.error("SpotifyAPI.get_playlist_via_librespot: Session API not ready.")
-                 return None
-
-            playlist_obj = self.librespot_session.api().get_playlist(p_id)
-            
-            if not playlist_obj:
-                self.logger.warning("SpotifyAPI.get_playlist_via_librespot: Librespot returned None.")
-                return None
-
-            self.logger.info(f"SpotifyAPI.get_playlist_via_librespot: Successfully retrieved playlist via Librespot.")
-            
-            # Convert Librespot Playlist object to dict format expected by interface
-            name = "Unknown Playlist (Librespot)"
-            if hasattr(playlist_obj, 'attributes') and hasattr(playlist_obj.attributes, 'name'):
-                name = playlist_obj.attributes.name
-                
-            # Parse tracks
-            items = []
-            if hasattr(playlist_obj, 'contents') and hasattr(playlist_obj.contents, 'items'):
-                for item in playlist_obj.contents.items:
-                    # item uri is usually "spotify:track:..."
-                    uri = item.uri
-                    # functionality to parse uri to id
-                    if uri and ":track:" in uri:
-                        t_id = uri.split(":track:")[-1]
-                        # We just need the track object with an ID for interface.py to fetch details later
-                        items.append({
-                            'track': {
-                                'id': t_id,
-                                'name': 'Loading...', # Placeholder, will be fetched by get_track_info
-                                'artists': [{'name': 'Loading...'}],
-                                'duration_ms': 0
-                            }
-                        })
-            
-            playlist_dict = {
-                'id': playlist_id,
-                'name': name,
-                'tracks': {
-                    'items': items,
-                    'total': len(items)
-                },
-                'description': getattr(playlist_obj.attributes, 'description', '') if hasattr(playlist_obj, 'attributes') else '',
-                'images': [] 
-            }
-            return playlist_dict
-
-        except Exception as e:
-            self.logger.error(f"SpotifyAPI.get_playlist_via_librespot: Error: {e}", exc_info=True)
-            return None
-
     def get_playlist_info(self, playlist_id: str, metadata: Optional['PlaylistInfo'] = None, _retry_attempted: bool = False) -> Optional[dict]:
         self.logger.info(f"SpotifyAPI: Attempting to get playlist info (Embed API) for ID: {playlist_id}")
 
@@ -2774,11 +2230,6 @@ Searching and browsing metadata does NOT require authentication.
              raise
         except Exception as e:
             self.logger.error(f"Unexpected error in get_playlist_info for {playlist_id}: {e}", exc_info=True)
-            # Fallback to librespot if Embed API fails completely? 
-            # Given the previous logic was broken anyway, let's try librespot if this is the first attempt.
-            if not _retry_attempted:
-                self.logger.info(f"Embed API failed for playlist {playlist_id}, attempting Librespot fallback.")
-                return self.get_playlist_via_librespot(playlist_id)
             raise SpotifyApiError(f"An unexpected error occurred while fetching playlist {playlist_id}: {e}")
 
 
@@ -3072,15 +2523,9 @@ Searching and browsing metadata does NOT require authentication.
             if http_err.response.status_code == 401:
                 self.logger.warning(f"SpotifyAPI.get_show_info: HTTPError 401 caught for {show_id}.")
                 if not _retry_attempted:
-                    self.logger.info("SpotifyAPI.get_show_info: Attempting re-authentication and retry for HTTPError 401.")
-                    # Invalidate Web API token and re-initialize session
-                    self.web_api_stored_token = None
-                    if self._load_credentials_and_init_session():
-                        self.logger.info("SpotifyAPI.get_show_info: Re-authentication successful. Retrying original call.")
-                        return self.get_show_info(show_id, metadata, _retry_attempted=True)
-                    else:
-                        self.logger.error("SpotifyAPI.get_show_info: Re-authentication failed after HTTPError 401.")
-                        raise SpotifyAuthError(f"Re-authentication failed for show {show_id} after HTTPError 401.")
+                    self.logger.info("SpotifyAPI.get_show_info: Refreshing anonymous token and retrying after HTTPError 401.")
+                    self.embed_client.get_anonymous_token(force_refresh=True)
+                    return self.get_show_info(show_id, metadata, _retry_attempted=True)
                 else:
                     self.logger.error(f"SpotifyAPI.get_show_info: HTTPError 401 for {show_id} even after retry.")
                     raise SpotifyAuthError(f"Authorization failed for show {show_id} (HTTPError 401) after retry.")
@@ -3166,152 +2611,8 @@ Searching and browsing metadata does NOT require authentication.
         """Episode audio download is disabled in desktop-only Spotify mode."""
         _ = kwargs
         raise SpotifyTrackUnavailableError(
-            "Spotify episode downloads are unavailable: librespot path was removed in desktop-only mode."
+            "Spotify episode downloads are unavailable in desktop-only mode."
         )
-
-        if not episode_id_base62:
-            self.logger.error("get_episode_download: No episode_id provided in kwargs")
-            raise SpotifyApiError("No episode_id provided for download")
-
-        # Convert base62 episode ID to hex GID format required by librespot
-        episode_id_hex = self._convert_base62_to_gid_hex(episode_id_base62)
-        if not episode_id_hex:
-            self.logger.error(f"Failed to convert episode_id '{episode_id_base62}' to hex GID format")
-            raise SpotifyApiError(f"Failed to convert episode_id '{episode_id_base62}' to hex GID format")
-
-        if not self._is_session_valid(self.librespot_session):
-            self.logger.error("Librespot session is not active or not logged in for episode download.")
-            if not self._load_credentials_and_init_session() or not self._is_session_valid(self.librespot_session):
-                 raise SpotifyAuthError("Authentication required/failed for episode download.")
-        
-        # Use EpisodeId for episodes (not TrackId)
-        episode_id_obj = EpisodeId.from_hex(episode_id_hex)
-        temp_file_path = None
-        try:
-            self.logger.info(f"Fetching librespot Episode metadata for GID hex: {episode_id_hex}")
-            # Verbose logging to diagnose the quality tier input issue
-            qt_type = type(quality_tier).__name__
-            qt_val = str(quality_tier)
-            qt_str = None
-            if hasattr(quality_tier, 'name'):
-                qt_str = quality_tier.name.upper()
-            elif isinstance(quality_tier, str):
-                qt_str = quality_tier.upper()
-
-            # Mapping requested by project:
-            # HIGH -> 320k, LOW -> 160k, other OGG tiers -> 96k
-            if qt_str in ["LOSSLESS", "HIFI", "ATMOS", "VERY_HIGH", "HIGH", "FLAC_24"]:
-                librespot_audio_quality_mode = LibrespotAudioQualityEnum.VERY_HIGH
-                display_bitrate = 320
-            elif qt_str in ["LOW"]:
-                librespot_audio_quality_mode = LibrespotAudioQualityEnum.HIGH
-                display_bitrate = 160
-            else:
-                librespot_audio_quality_mode = LibrespotAudioQualityEnum.NORMAL
-                display_bitrate = 96
-
-            self.logger.info(f"Quality tier input: '{qt_val}' ({qt_type}), resolved to '{qt_str}', mapped to librespot: {librespot_audio_quality_mode.name if hasattr(librespot_audio_quality_mode, 'name') else librespot_audio_quality_mode} ({display_bitrate}kbps)")
-            
-            # Ensure our audio key filter is still active before librespot operations
-            if hasattr(self, '_audio_key_filter'):
-                # Reapply filter to ensure it's active for this operation
-                for handler in logging.getLogger().handlers:
-                    if self._audio_key_filter not in handler.filters:
-                        handler.addFilter(self._audio_key_filter)
-            
-            content_feeder = self.librespot_session.content_feeder()
-            self.logger.info(f"Attempting to load episode {episode_id_hex} using content_feeder.load_episode with VorbisOnlyAudioQuality.")
-            try:
-                stream_loader = content_feeder.load_episode(
-                    episode_id_obj,
-                    VorbisOnlyAudioQuality(librespot_audio_quality_mode),
-                    False, 
-                    None   
-                )
-            except Exception as load_err:
-                error_str = str(load_err).lower()
-                if "status code 404" in error_str or "extended metadata request failed" in error_str:
-                    self.logger.info(f"Episode load failed with 404 for {episode_id_hex}. Re-raising as SpotifyApiError.")
-                    raise SpotifyApiError(f"Failed to download episode {episode_id_hex}: Extended Metadata request failed: Status code 404") from load_err
-                raise
-            if not stream_loader or not hasattr(stream_loader, 'input_stream') or not stream_loader.input_stream:
-                self.logger.error(f"Librespot returned no stream_loader or input_stream for episode {episode_id_hex} (EpisodeId: {str(episode_id_obj)}).")
-                try:
-                    # Try to get episode metadata using the proper API method
-                    episode_metadata_check = self.librespot_session.api().get_metadata_4_episode(episode_id_obj)
-                    if episode_metadata_check and not episode_metadata_check.file:
-                         self.logger.error(f"Additionally, episode metadata for GID {episode_id_hex} has no associated audio files.")
-                         raise SpotifyTrackUnavailableError(f"No audio files listed for episode GID {episode_id_hex} and stream_loader failed.")
-                    elif not episode_metadata_check:
-                         self.logger.error(f"Additionally, failed to get any episode metadata from librespot for GID hex: {episode_id_hex}")
-                except Exception as meta_err:
-                     self.logger.error(f"Error during additional metadata check for {episode_id_hex} after stream_loader failure: {meta_err}")
-                raise SpotifyTrackUnavailableError(f"Failed to load audio stream (no stream_loader or input_stream) for episode GID {episode_id_hex}")
-            
-            raw_audio_byte_stream = stream_loader.input_stream.stream()
-            temp_file_path = self._save_stream_to_temp_file(raw_audio_byte_stream, CodecEnum.VORBIS)
-            if not temp_file_path:
-                self.logger.error(f"Failed to save downloaded stream for episode GID {episode_id_hex} to a temp file.")
-                if hasattr(stream_loader, 'input_stream') and stream_loader.input_stream and hasattr(stream_loader.input_stream, 'close'):
-                    try:
-                        stream_loader.input_stream.close()
-                    except Exception as close_ex:
-                        self.logger.warning(f"Exception while closing input_stream after save failure for episode {episode_id_hex}: {close_ex}")
-                return None
-            
-            self.logger.info(f"Successfully downloaded episode {episode_id_hex} to {temp_file_path}")
-            if track_info_obj:
-                if hasattr(track_info_obj, 'codec'):
-                    track_info_obj.codec = CodecEnum.VORBIS
-                if hasattr(track_info_obj, 'bitrate'):
-                    # Explicitly set the bitrate value based on our early mapping
-                    track_info_obj.bitrate = display_bitrate
-                if hasattr(track_info_obj, 'sample_rate'):
-                    track_info_obj.sample_rate = 44.1
-                if hasattr(track_info_obj, 'bit_depth'):
-                    track_info_obj.bit_depth = 16
-            
-            return TrackDownloadInfo(
-                download_type=DownloadEnum.TEMP_FILE_PATH,
-                temp_file_path=temp_file_path,
-            )
-        except SpotifyAuthError: 
-            raise
-        except SpotifyTrackUnavailableError as e: 
-            self.logger.warning(f"Episode {episode_id_hex} is unavailable for download: {e}")
-            raise 
-        except SpotifyItemNotFoundError as e: 
-            self.logger.warning(f"Episode metadata for {episode_id_hex} not found: {e}")
-            raise 
-        except RuntimeError as rt_err:
-            if "Failed fetching audio key!" in str(rt_err):
-                is_premium = False
-                if hasattr(self, 'librespot_session') and self.librespot_session:
-                    is_premium = (self.librespot_session.get_user_attribute("type", "free") == "premium")
-                
-                if not is_premium:
-                    error_msg = "Spotify Premium is required to download audio (Free accounts cannot fetch audio keys)."
-                    self.logger.warning(error_msg)
-                    raise SpotifyTrackUnavailableError(error_msg) from rt_err
-                else:
-                    error_msg = "Spotify Premium audio key rejected. Your IP/Account may be temporarily rate-limited, or this episode requires unsupported DRM."
-                    self.logger.warning(error_msg)
-                    raise SpotifyRateLimitDetectedError(error_msg) from rt_err
-            elif str(rt_err) == "Cannot get alternative track":
-                self.logger.warning(f"Episode {episode_id_hex} is unavailable (librespot: Cannot get alternative track).")
-                raise SpotifyTrackUnavailableError(f"Episode {episode_id_hex} is unavailable (Cannot get alternative track)") from rt_err
-            else:
-                self.logger.error(f"Unhandled RuntimeError during get_episode_download for {episode_id_hex}: {rt_err}", exc_info=True)
-                raise SpotifyApiError(f"Runtime error during episode download {episode_id_hex}: {rt_err}") from rt_err
-        except Exception as e:
-            self.logger.error(f"Unexpected error during get_episode_download for {episode_id_hex}: {e}", exc_info=True)
-            if temp_file_path and os.path.exists(temp_file_path):
-                try:
-                    os.unlink(temp_file_path)
-                    self.logger.info(f"Cleaned up temp file {temp_file_path} after error in get_episode_download.")
-                except OSError as unlink_e:
-                    self.logger.error(f"Error unlinking temp file {temp_file_path} during error handling: {unlink_e}")
-            raise SpotifyApiError(f"Failed to download episode {episode_id_hex}: {e}") from e
 
     def get_episode_info(self, episode_id: str, quality_tier: QualityEnum, codec_options: CodecOptions, **extra_kwargs) -> Optional[TrackInfo]:
         """Get episode information and convert to TrackInfo format for compatibility."""
@@ -3404,7 +2705,7 @@ Searching and browsing metadata does NOT require authentication.
 
 # --- Main function for testing or standalone use (Optional) ---
 def main():
-    parser = argparse.ArgumentParser(description="Search Spotify via its Web API using librespot for auth.")
+    parser = argparse.ArgumentParser(description="Search Spotify via its Web API.")
     parser.add_argument("search_type", choices=["album", "track", "artist", "playlist", "show", "episode"], help="The type of item to search for.")
     parser.add_argument("query", help="The search query string.")
     parser.add_argument("--limit", type=int, default=5, help="Number of results to display.")
