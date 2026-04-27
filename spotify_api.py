@@ -14,6 +14,7 @@ import io
 import contextlib
 import platform
 import subprocess as sp
+import httpx
 
 from utils.utils import find_system_ffmpeg, get_clean_env
 from utils.vendor_bootstrap import bootstrap_vendor_paths
@@ -29,12 +30,6 @@ from urllib.parse import urlencode, urlparse, parse_qs
 import secrets
 import base64
 import hashlib
-
-# Optional TrackId import for base62->gid conversion helper.
-try:
-    from librespot.metadata import TrackId
-except Exception:
-    TrackId = None  # type: ignore
 
 # Attempt to import necessary types from utils.models for return types and enums
 try:
@@ -820,8 +815,15 @@ Searching and browsing metadata does NOT require authentication.
             if not isinstance(base62_id, str):
                 self.logger.error(f"base62_id must be a string, got {type(base62_id)}: {base62_id}")
                 return None
-            gid_obj = TrackId.from_base62(base62_id)
-            hex_id = gid_obj.hex_id()
+            alphabet = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
+            base = 62
+            value = 0
+            for char in base62_id:
+                idx = alphabet.find(char)
+                if idx == -1:
+                    raise ValueError(f"Invalid base62 character: {char}")
+                value = value * base + idx
+            hex_id = f"{value:032x}"
             self.logger.info(f"Converted base62 ID '{base62_id}' to GID hex '{hex_id}'")
             return hex_id
         except Exception as e:
@@ -1326,7 +1328,7 @@ Searching and browsing metadata does NOT require authentication.
         if not self.is_desktop_api_available():
             raise SpotifyApiError(
                 "Desktop Spotify audio path requires spotify-cookies (sp_dc) and Spotify.dll. "
-                "Librespot fallback has been disabled."
+                "No fallback method is enabled."
             )
 
         return self._download_using_desktop_api(
@@ -1413,16 +1415,16 @@ Searching and browsing metadata does NOT require authentication.
                     if stream_info:
                         self.logger.debug("Found standard FLAC stream!")
             else:
-                # OGG/VORBIS mapping requested by project:
-                # HIGH -> 320k (id 4), LOW -> 160k (id 3), others -> 96k (id 2)
+                # OGG/VORBIS mapping aligned with Votify:
+                # HIGH -> 320k (id 2), LOW -> 160k (id 1), MINIMUM -> 96k (id 0)
                 preferred_ids = []
                 if qt_str in ["VERY_HIGH", "HIGH"]:
-                    preferred_ids = [4, 3, 2]
+                    preferred_ids = [2, 1, 0]
                 elif qt_str in ["LOW"]:
-                    # 160k then 96k — never auto-upgrade to 320k (id 4) when OGG 160 / LOW is requested
-                    preferred_ids = [3, 2]
+                    # 160k then 96k — never auto-upgrade to 320k when OGG 160 / LOW is requested
+                    preferred_ids = [1, 0]
                 else:
-                    preferred_ids = [2, 3, 4]
+                    preferred_ids = [0, 1, 2]
                 
                 # Find the first available format ID from our preferred list
                 target_format_id = next((fid for fid in preferred_ids if fid in available_formats), None)
@@ -1435,15 +1437,16 @@ Searching and browsing metadata does NOT require authentication.
                 self.logger.error(f"Could not find any suitable stream in available formats: {available_formats}")
                 raise SpotifyTrackUnavailableError("Requested audio stream is not available via Desktop API.")
                 
-            file_id_hex, stream_url = stream_info
+            file_id_hex, file_id_bytes, cdn_urls = stream_info
             
             # Determine final codec and extension based on target_format_id
             # 16, 22 = FLAC | 4, 3, 2 = VORBIS (OGG)
             final_codec = CodecEnum.FLAC if target_format_id in [16, 22] else CodecEnum.VORBIS
             file_extension = ".flac" if final_codec == CodecEnum.FLAC else ".ogg"
+            is_ogg = final_codec == CodecEnum.VORBIS
             
             self.logger.debug(f"Decrypting and downloading {final_codec.name} stream ID: {file_id_hex}")
-            decryption_key = api.get_playplay_key(file_id_hex)
+            decryption_key = api.get_playplay_key(file_id_hex, file_id_bytes)
             
             import tempfile
             project_root_for_temp = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -1453,32 +1456,27 @@ Searching and browsing metadata does NOT require authentication.
             with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension, dir=target_temp_dir) as temp_file:
                 temp_file_path = temp_file.name
                 
-            from .desktop_api import FLAC_IV
-            if final_codec == CodecEnum.VORBIS:
-                # Match votify desktop PlayPlay behavior for OGG:
-                # decrypt with FLAC_IV and strip 167-byte preface before OggS.
-                target_iv = FLAC_IV
-                api.download_and_decrypt(
-                    stream_url,
-                    decryption_key,
-                    temp_file_path,
-                    iv_hex=target_iv,
-                    byte_skip=167,
+            # Download, decrypt (AES-CTR with FLAC_IV), and for OGG reconstruct pages
+            api.download_and_decrypt(
+                cdn_urls,
+                decryption_key,
+                temp_file_path,
+                is_ogg=is_ogg,
+            )
+            # Safety validation before tagger so users get a clear download-stage failure.
+            try:
+                with open(temp_file_path, "rb") as f:
+                    magic = f.read(4)
+            except Exception:
+                magic = b""
+            if final_codec == CodecEnum.VORBIS and magic != b"OggS":
+                raise SpotifyApiError(
+                    f"Desktop OGG decrypt validation failed (header={magic!r})."
                 )
-            else:
-                target_iv = FLAC_IV
-                api.download_and_decrypt(stream_url, decryption_key, temp_file_path, iv_hex=target_iv)
-            if final_codec == CodecEnum.VORBIS:
-                # Safety validation before tagger.
-                try:
-                    with open(temp_file_path, "rb") as f:
-                        magic = f.read(4)
-                except Exception:
-                    magic = b""
-                if magic != b"OggS":
-                    raise SpotifyApiError(
-                        f"Desktop OGG decrypt validation failed after votify-style decrypt (header={magic!r})."
-                    )
+            if final_codec == CodecEnum.FLAC and magic != b"fLaC":
+                raise SpotifyApiError(
+                    f"Desktop FLAC decrypt validation failed (header={magic!r})."
+                )
             
             if track_info_obj:
                 track_info_obj.codec = final_codec
@@ -1486,8 +1484,8 @@ Searching and browsing metadata does NOT require authentication.
                     track_info_obj.bitrate = None # Lossless
                     track_info_obj.bit_depth = 24 if target_format_id == 22 else 16
                 else:
-                    # Map format IDs back to display bitrates for tagging
-                    bitrate_map = {4: 320, 3: 160, 2: 96}
+                    # Map format IDs back to display bitrates for tagging.
+                    bitrate_map = {2: 320, 1: 160, 0: 96}
                     track_info_obj.bitrate = bitrate_map.get(target_format_id, 320)
                     track_info_obj.bit_depth = 16
                 track_info_obj.sample_rate = 44.1
@@ -1501,6 +1499,13 @@ Searching and browsing metadata does NOT require authentication.
 
         except SpotifyTrackUnavailableError:
             raise
+        except SpotifyApiError as e:
+            # Expected when CDN/key material no longer matches our decrypt path — not a code bug; avoid traceback spam.
+            if "decrypt validation failed" in str(e).lower():
+                self.logger.warning(f"Desktop download: {e}")
+            else:
+                self.logger.error(f"Desktop download failed: {e}", exc_info=True)
+            raise SpotifyApiError(f"Desktop download failure: {e}")
         except Exception as e:
             self.logger.error(f"Desktop download failed: {e}", exc_info=True)
             raise SpotifyApiError(f"Desktop download failure: {e}")
@@ -2169,11 +2174,7 @@ Searching and browsing metadata does NOT require authentication.
         """
         try:
             # Always use anonymous for GraphQL to avoid 401/403 with non-official tokens
-            try:
-                credits_data = self.embed_client.get_track_credits(track_id, external_token=None)
-            except Exception as e_ext:
-                self.logger.warning(f"GraphQL credits failed: {e_ext}")
-                raise e_ext
+            credits_data = self.embed_client.get_track_credits(track_id, external_token=None)
             
             track_union = credits_data.get('trackUnion', {})
             credits_obj = track_union.get('credits', {})
@@ -2197,7 +2198,13 @@ Searching and browsing metadata does NOT require authentication.
             return None
             
         except Exception as e:
-            self.logger.warning(f"Error fetching credits for {track_id} via GraphQL: {e}")
+            error_text = str(e)
+            if "unauthorized (401)" in error_text.lower():
+                self.logger.warning(
+                    f"GraphQL credits unavailable for {track_id} (401). Continuing without composer metadata."
+                )
+            else:
+                self.logger.warning(f"Error fetching credits for {track_id} via GraphQL: {e}")
             return None
 
     def get_playlist_info(self, playlist_id: str, metadata: Optional['PlaylistInfo'] = None, _retry_attempted: bool = False) -> Optional[dict]:

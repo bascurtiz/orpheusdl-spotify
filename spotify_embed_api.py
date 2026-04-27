@@ -192,11 +192,17 @@ class SpotifyEmbedClient:
             )
             
             # Check for auth errors
-            if response.status_code == 401 and retry_on_auth_error and not external_token:
-                self.logger.warning("GraphQL query returned 401, refreshing token and retrying")
-                # Force refresh token and retry once
-                self.get_anonymous_token(force_refresh=True)
-                return self._graphql_query(operation_name, variables, retry_on_auth_error=False)
+            if response.status_code == 401:
+                if retry_on_auth_error and not external_token:
+                    self.logger.warning(
+                        f"GraphQL {operation_name} returned 401, refreshing token and retrying once"
+                    )
+                    # Force refresh token and retry once
+                    self.get_anonymous_token(force_refresh=True)
+                    return self._graphql_query(operation_name, variables, retry_on_auth_error=False)
+                raise SpotifyEmbedAuthError(
+                    f"GraphQL {operation_name} unauthorized (401)"
+                )
             
             response.raise_for_status()
             
@@ -211,6 +217,13 @@ class SpotifyEmbedClient:
             return data
             
         except requests.RequestException as e:
+            status_code = getattr(getattr(e, "response", None), "status_code", None)
+            if status_code == 401:
+                auth_error = SpotifyEmbedAuthError(
+                    f"GraphQL {operation_name} unauthorized (401)"
+                )
+                self.logger.warning(str(auth_error))
+                raise auth_error
             self.logger.error(f"GraphQL query failed: {e}")
             raise SpotifyEmbedError(f"GraphQL query failed: {e}")
     

@@ -841,16 +841,15 @@ class ModuleInterface:
         if codec_options is None:
             codec_options = kwargs.get("codec_options") or kwargs.get("codec_data")
             
-        # Desktop API (sp_dc + Spotify.dll): FLAC/lossless and OGG Vorbis — skip Librespot OAuth for those when configured
+        # Desktop API (sp_dc + Spotify.dll): FLAC/lossless and OGG Vorbis.
         wants_desktop = self.spotify_api.wants_spotify_desktop_stream(quality_tier, codec_options)
         using_desktop_api = wants_desktop and self.spotify_api.is_desktop_api_available()
 
         if using_desktop_api:
-            self.logger.info("Using Desktop API for Spotify stream (FLAC/OGG), skipping Librespot session check.")
+            self.logger.info("Using Desktop API for Spotify stream (FLAC/OGG).")
         else:
-            # Librespot OAuth for OGG (when desktop not used), episodes, etc.
             if not self._ensure_authenticated("get_track_download"):
-                self.logger.warning("Librespot authentication failed in get_track_download, cannot proceed for this track.")
+                self.logger.warning("Desktop authentication failed in get_track_download, cannot proceed for this track.")
                 return None
             
         track_info = kwargs.get("track_info_obj")
@@ -952,21 +951,10 @@ class ModuleInterface:
                 
                 reauth_success = False
                 try:
-                    # Step 1: Try refreshing token from stored credentials (no browser needed)
-                    if self.spotify_api._load_existing_credentials() and self.spotify_api.stored_token:
-                        if self.spotify_api._create_librespot_session_from_oauth():
-                            self.logged_in = True
-                            reauth_success = True
-                            self.logger.info("Re-authentication via token refresh succeeded.")
-                    
-                    # Step 2: If refresh failed, do full OAuth flow (opens browser)
-                    if not reauth_success:
-                        self.printer.oprint("Token refresh failed. Opening browser for Spotify re-authorization...", drop_level=0)
-                        if self.spotify_api._perform_oauth_flow():
-                            if self.spotify_api._create_librespot_session_from_oauth():
-                                self.logged_in = True
-                                reauth_success = True
-                                self.logger.info("Re-authentication via full OAuth flow succeeded.")
+                    if self.spotify_api.authenticate_stream_api():
+                        self.logged_in = True
+                        reauth_success = True
+                        self.logger.info("Re-authentication via desktop prerequisites check succeeded.")
                 
                 except Exception as reauth_err:
                     self.logger.error(f"Re-authentication attempt failed: {reauth_err}", exc_info=True)
@@ -984,8 +972,34 @@ class ModuleInterface:
                     self.printer.oprint(f"Re-authentication failed. {e}", drop_level=0)
                     return None
             else:
-                self.printer.oprint(f"Spotify API error during track download: {e}", drop_level=0)
-                self.logger.error(f"SpotifyApiError during track download: {e}", exc_info=self.debug_mode)
+                lowered = error_str.lower()
+                if "desktop ogg decrypt validation failed" in lowered:
+                    self.printer.oprint(
+                        "Spotify desktop stream downloaded, but OGG validation failed after decrypt. "
+                        "Please retry later and refresh spotify-cookies.txt if it keeps failing.",
+                        drop_level=0,
+                    )
+                elif "desktop flac decrypt validation failed" in lowered:
+                    self.printer.oprint(
+                        "Spotify desktop stream downloaded, but FLAC validation failed after decrypt. "
+                        "Please retry later and refresh spotify-cookies.txt if it keeps failing.",
+                        drop_level=0,
+                    )
+                elif "desktop download failure" in lowered and "decrypt validation failed" in lowered:
+                    self.printer.oprint(
+                        "Spotify desktop decrypt validation failed for this track. "
+                        "Please retry later.",
+                        drop_level=0,
+                    )
+                else:
+                    self.printer.oprint(f"Spotify API error during track download: {e}", drop_level=0)
+                is_decrypt_validation = "decrypt validation failed" in error_str.lower()
+                if is_decrypt_validation:
+                    self.logger.warning(f"SpotifyApiError during track download: {e}")
+                else:
+                    self.logger.error(
+                        f"SpotifyApiError during track download: {e}", exc_info=self.debug_mode
+                    )
                 return None
         except Exception as e:
             self.printer.oprint(f"An unexpected error occurred during Spotify track download: {e}", drop_level=0)

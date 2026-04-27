@@ -6,7 +6,7 @@ A Spotify module for the OrpheusDL modular archival music program
 
 1.  **Spotify Premium Account:** Essential for accessing audio streams in high quality.
 2.  **OrpheusDL:** [My fork](https://github.com/bascurtiz/orpheusdl) is needed to make Spotify's module work.
-3.  **Vendored Librespot:** A patched copy of `librespot-python` ships inside `vendor/librespot`, so you no longer need to install it from pip. This avoids protobuf version conflicts with other modules such as Apple Music.
+3.  **Desktop API method:** Spotify downloads use the Desktop API pathway only.
 
 ## Installation
 
@@ -55,7 +55,7 @@ When enabling the Spotify module in OrpheusDL (e.g., via `config/settings.json` 
 
 This module primarily uses a unified OAuth 2.0 PKCE (Proof Key for Code Exchange) flow for both:
 *   **GraphQL / Embed API Access:** For searching, retrieving metadata (track, album, playlist, artist info).
-*   **Stream API Access:** For accessing audio streams for downloads via the integrated Librespot functionality.
+*   **Stream API Access:** For accessing audio streams for downloads via the Desktop API pathway.
 
 **Process:**
 
@@ -79,7 +79,7 @@ This module primarily uses a unified OAuth 2.0 PKCE (Proof Key for Code Exchange
 **Lossless (HiFi/FLAC) downloads are NOT supported** as the underlying stream from Spotify is (still) lossy.
 *   **Terms of Service:** Downloading streams may violate Spotify\'s Terms of Service. Use this module responsibly and at your own risk.
 *   **Premium Required:** This module **will not work** with Spotify Free accounts.
-*   **Internal Stability:** Relies on the internally integrated `librespot-python` derived logic.
+*   **Internal Stability:** Relies on the integrated Desktop API implementation.
 
 ## Usage
 
