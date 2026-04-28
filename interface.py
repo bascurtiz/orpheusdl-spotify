@@ -606,8 +606,9 @@ class ModuleInterface:
         # Use silent=True because we'll return the error in TrackInfo.error for the downloader to print.
         auth_ok = self._ensure_authenticated("get_track_info", silent=True)
         error_msg = (
-            "Spotify download requirements missing: place Spotify.dll and a valid spotify-cookies.txt "
-            "(with sp_dc) in Settings. Active Premium subscription required."
+            "Spotify download requirements missing: place Spotify.dll in root folder "
+            "(next to orpheus.py) and a valid spotify-cookies.txt in config folder "
+            "(next to settings.json)."
         )
 
         try:
