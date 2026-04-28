@@ -16,8 +16,97 @@ import platform
 import subprocess as sp
 import httpx
 
-from utils.utils import find_system_ffmpeg, get_clean_env
-from utils.vendor_bootstrap import bootstrap_vendor_paths
+try:
+    from utils.utils import find_system_ffmpeg, get_clean_env
+except ImportError:
+    _ffmpeg_cache = None
+
+    def get_clean_env():
+        """Return a subprocess environment that is safe for source and frozen runs."""
+        env = os.environ.copy()
+        is_frozen = getattr(sys, 'frozen', False)
+        has_orig_ld = 'LD_LIBRARY_PATH_ORIG' in env
+        has_orig_dyld = 'DYLD_LIBRARY_PATH_ORIG' in env
+
+        if is_frozen or has_orig_ld or has_orig_dyld:
+            env.pop('LD_LIBRARY_PATH', None)
+            env.pop('DYLD_LIBRARY_PATH', None)
+            if has_orig_ld:
+                env['LD_LIBRARY_PATH'] = env['LD_LIBRARY_PATH_ORIG']
+            if has_orig_dyld:
+                env['DYLD_LIBRARY_PATH'] = env['DYLD_LIBRARY_PATH_ORIG']
+
+        return env
+
+    def find_system_ffmpeg():
+        """Find FFmpeg without depending on GUI-specific utility helpers."""
+        global _ffmpeg_cache
+        if _ffmpeg_cache is not None:
+            return _ffmpeg_cache
+
+        system = platform.system()
+        common_paths = []
+        if system == 'Darwin':
+            common_paths = [
+                '/opt/homebrew/bin/ffmpeg',
+                '/usr/local/bin/ffmpeg',
+                '/usr/bin/ffmpeg',
+            ]
+        elif system == 'Linux':
+            common_paths = [
+                '/usr/bin/ffmpeg',
+                '/usr/local/bin/ffmpeg',
+                '/snap/bin/ffmpeg',
+            ]
+        elif system == 'Windows':
+            common_paths = [
+                'C:/ProgramData/chocolatey/bin/ffmpeg.exe',
+                os.path.expandvars('%USERPROFILE%/scoop/shims/ffmpeg.exe'),
+                'C:/ffmpeg/bin/ffmpeg.exe',
+            ]
+
+        try:
+            project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            root_ffmpeg = os.path.join(project_root, 'ffmpeg.exe' if system == 'Windows' else 'ffmpeg')
+            common_paths = [root_ffmpeg] + common_paths
+        except Exception:
+            pass
+
+        for path in common_paths:
+            try:
+                run_kwargs = {'capture_output': True, 'timeout': 3, 'env': get_clean_env()}
+                if system == 'Windows':
+                    run_kwargs['creationflags'] = getattr(sp, 'CREATE_NO_WINDOW', 0)
+                result = sp.run([path, '-version'], **run_kwargs)
+                if result.returncode == 0:
+                    _ffmpeg_cache = (True, path)
+                    return _ffmpeg_cache
+            except Exception:
+                pass
+
+        try:
+            cmd = 'where' if system == 'Windows' else 'which'
+            ffmpeg_name = 'ffmpeg.exe' if system == 'Windows' else 'ffmpeg'
+            run_kwargs = {'capture_output': True, 'timeout': 3, 'env': get_clean_env()}
+            if system == 'Windows':
+                run_kwargs['creationflags'] = getattr(sp, 'CREATE_NO_WINDOW', 0)
+            result = sp.run([cmd, ffmpeg_name], **run_kwargs)
+            if result.returncode == 0:
+                ffmpeg_path = result.stdout.decode().strip().split('\n')[0].strip()
+                if ffmpeg_path and os.path.isfile(ffmpeg_path):
+                    _ffmpeg_cache = (True, ffmpeg_path)
+                    return _ffmpeg_cache
+        except Exception:
+            pass
+
+        _ffmpeg_cache = (False, None)
+        return _ffmpeg_cache
+
+try:
+    from utils.vendor_bootstrap import bootstrap_vendor_paths
+except ImportError:
+    def bootstrap_vendor_paths():
+        return []
 bootstrap_vendor_paths()
 
 # OAuth and HTTP server imports for Zotify-style authentication
