@@ -1,9 +1,11 @@
 import datetime
+import inspect
 import logging
 import os
 import sys
 import time
 import concurrent.futures
+from dataclasses import fields, is_dataclass
 from typing import Optional, List, Tuple
 from enum import Enum
 from traceback import print_exc
@@ -92,6 +94,33 @@ from .spotify_api import (
     SpotifyItemNotFoundError,
     SpotifyTrackUnavailableError,
 )
+
+def _create_model_instance(model_cls, **kwargs):
+    """Instantiate Orpheus models across core versions with different fields."""
+    accepted_fields = None
+    if is_dataclass(model_cls):
+        accepted_fields = {field.name for field in fields(model_cls)}
+    else:
+        try:
+            signature = inspect.signature(model_cls.__init__)
+            parameters = signature.parameters.values()
+            if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters):
+                accepted_fields = None
+            else:
+                accepted_fields = {
+                    param.name for param in parameters
+                    if param.name != 'self'
+                }
+        except (TypeError, ValueError):
+            accepted_fields = None
+
+    if accepted_fields is not None:
+        kwargs = {
+            key: value for key, value in kwargs.items()
+            if key in accepted_fields
+        }
+
+    return model_cls(**kwargs)
 
 # Define the module information object after ModuleFlags is properly defined
 module_information = ModuleInformation(
@@ -1429,11 +1458,13 @@ class ModuleInterface:
             total_duration_s = sum(track.duration for track in parsed_tracks if track.duration) if parsed_tracks else 0
             self.logger.info(f"Album parsing successful for: {album_name} (ID: {album_id}), Artist: {primary_artist_name}, Release Year: {release_year}, Tracks: {len(parsed_tracks)}")
             
-            return AlbumInfo(
+            return _create_model_instance(
+                AlbumInfo,
                 name=album_name,
                 artist=primary_artist_name,
                 artist_id=album_artist_ids[0] if album_artist_ids else None,
                 tracks=parsed_tracks,
+                cover_url=cover_url,
                 all_track_cover_jpg_url=cover_url,
                 release_year=release_year,
                 explicit=is_explicit_album,
