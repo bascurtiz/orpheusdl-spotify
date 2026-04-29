@@ -22,7 +22,7 @@ _runtime_version.ValidateProtobufRuntimeVersion(
 _sym_db = _symbol_database.Default()
 
 
-from votify.api.proto import extendedmetadata_pb2 as votify_dot_api_dot_proto_dot_extendedmetadata__pb2
+from . import extendedmetadata_pb2 as votify_dot_api_dot_proto_dot_extendedmetadata__pb2
 
 
 DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n,votify/api/proto/audio_files_extension.proto\x12\"votify.extendedmetadata.audiofiles\x1a\'votify/api/proto/extendedmetadata.proto\"@\n\x13NormalizationParams\x12\x13\n\x0bloudness_db\x18\x01 \x01(\x02\x12\x14\n\x0ctrue_peak_db\x18\x02 \x01(\x02\"j\n\x11\x45xtendedAudioFile\x12\x30\n\x04\x66ile\x18\x01 \x01(\x0b\x32\".votify.extendedmetadata.AudioFile\x12\x17\n\x0f\x61verage_bitrate\x18\x04 \x01(\x05J\x04\x08\x02\x10\x03J\x04\x08\x03\x10\x04\"\xbe\x02\n\x1b\x41udioFilesExtensionResponse\x12\x44\n\x05\x66iles\x18\x01 \x03(\x0b\x32\x35.votify.extendedmetadata.audiofiles.ExtendedAudioFile\x12\x62\n!default_file_normalization_params\x18\x02 \x01(\x0b\x32\x37.votify.extendedmetadata.audiofiles.NormalizationParams\x12\x63\n\"default_album_normalization_params\x18\x03 \x01(\x0b\x32\x37.votify.extendedmetadata.audiofiles.NormalizationParams\x12\x10\n\x08\x61udio_id\x18\x04 \x01(\x0c\x62\x06proto3')

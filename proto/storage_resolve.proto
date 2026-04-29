@@ -2,7 +2,7 @@
 
 syntax = "proto3";
 
-package spotify.download.proto;
+package orpheus.spotify.download.proto;
 
 option optimize_for = CODE_SIZE;
 

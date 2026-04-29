@@ -101,9 +101,13 @@ module_information = ModuleInformation(
     ],
     login_behaviour=ManualEnum.manual,
     global_settings={
-        "download_pause_seconds": 30,
-        "cookies_path": "",
-        "spotify_dll_path": "./Spotify.dll"
+        "username": "",
+        "download_pause_seconds": 15,
+        "client_id": "",
+        "client_secret": "",
+        "cookies_path": "./config/spotify-cookies.txt",
+        "spotify_dll_path": "./Spotify.dll",
+        "use_spotify_dll": "false",
     },
     session_settings={},
     module_supported_modes=[
@@ -157,24 +161,58 @@ class ModuleInterface:
             'artist': {}
         }
 
+    @staticmethod
+    def _use_spotify_dll_setting(settings: dict) -> bool:
+        val = (settings or {}).get("use_spotify_dll")
+        if val is None:
+            return False
+        return str(val).lower() in ("true", "1", "yes")
+
     def _ensure_authenticated(self, context_message: str, silent: bool = False) -> bool:
-        """Desktop-only auth check (sp_dc + Spotify.dll)."""
+        """Validate credentials for the selected Spotify backend (Desktop API or Librespot)."""
         if self.debug_mode:
-            self.logger.info(f"[{context_message}] Desktop-only auth check.")
+            self.logger.info(f"[{context_message}] Spotify auth check.")
+        use_dll = self._use_spotify_dll_setting(self.settings)
+        cfg = self.settings or {}
         try:
+            if use_dll:
+                auth_ok = self.spotify_api.authenticate_stream_api()
+                self.logged_in = bool(auth_ok)
+                if not auth_ok and not silent:
+                    self.printer.oprint(
+                        "Spotify Desktop API requires spotify-cookies.txt (sp_dc) and Spotify.dll. "
+                        "Check Settings → Spotify."
+                    )
+                return bool(auth_ok)
+
+            missing = []
+            if not (cfg.get("username") or "").strip():
+                missing.append("username")
+            if not (cfg.get("client_id") or "").strip():
+                missing.append("client ID")
+            if not (cfg.get("client_secret") or "").strip():
+                missing.append("client secret")
+            if missing:
+                self.logged_in = False
+                if not silent:
+                    self.printer.oprint(
+                        "Spotify Librespot mode requires: " + ", ".join(missing) + ". "
+                        "Fill these in Settings → Spotify, or enable 'Use Spotify.dll instead'."
+                    )
+                return False
+
             auth_ok = self.spotify_api.authenticate_stream_api()
             self.logged_in = bool(auth_ok)
             if not auth_ok and not silent:
                 self.printer.oprint(
-                    "Spotify desktop authentication requirements missing. "
-                    "Please set spotify-cookies.txt (sp_dc) and Spotify.dll in Settings."
+                    "Spotify Librespot login failed. Complete browser OAuth when prompted, or check credentials."
                 )
             return bool(auth_ok)
         except SpotifyConfigError:
             raise
         except Exception as e_auth_unexpected:
             self.logger.error(
-                f"[{context_message}] Unexpected exception during desktop auth check: {e_auth_unexpected}",
+                f"[{context_message}] Unexpected exception during Spotify auth check: {e_auth_unexpected}",
                 exc_info=True,
             )
             if not silent:
@@ -842,15 +880,23 @@ class ModuleInterface:
         if codec_options is None:
             codec_options = kwargs.get("codec_options") or kwargs.get("codec_data")
             
-        # Desktop API (sp_dc + Spotify.dll): FLAC/lossless and OGG Vorbis.
-        wants_desktop = self.spotify_api.wants_spotify_desktop_stream(quality_tier, codec_options)
-        using_desktop_api = wants_desktop and self.spotify_api.is_desktop_api_available()
-
-        if using_desktop_api:
-            self.logger.info("Using Desktop API for Spotify stream (FLAC/OGG).")
+        use_dll = self._use_spotify_dll_setting(self.settings)
+        if use_dll:
+            wants_desktop = self.spotify_api.wants_spotify_desktop_stream(quality_tier, codec_options)
+            using_desktop_api = wants_desktop and self.spotify_api.is_desktop_api_available()
+            if using_desktop_api:
+                self.logger.info("Using Desktop API for Spotify stream (FLAC/OGG).")
+            else:
+                if not self._ensure_authenticated("get_track_download"):
+                    self.logger.warning(
+                        "Spotify authentication failed in get_track_download, cannot proceed for this track."
+                    )
+                    return None
         else:
             if not self._ensure_authenticated("get_track_download"):
-                self.logger.warning("Desktop authentication failed in get_track_download, cannot proceed for this track.")
+                self.logger.warning(
+                    "Spotify Librespot authentication failed in get_track_download, cannot proceed for this track."
+                )
                 return None
             
         track_info = kwargs.get("track_info_obj")
